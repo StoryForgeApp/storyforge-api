@@ -1,5 +1,5 @@
 [dependencies]
-nixPkgs = ["bun", "boost183"]
+nixPkgs = ["bun", "boost183", "zlib", "bzip2", "gcc"]
 
 [phases.install]
 cmds = ["bun install"]
