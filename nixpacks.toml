@@ -8,4 +8,4 @@ cmds = ["bun install"]
 cmds = ["bun run build"]
 
 [start]
-cmd = "./server"
+cmd = "bash -lc 'export LD_LIBRARY_PATH=$(dirname $(readlink -f $(which innoextract)))/../lib:${LD_LIBRARY_PATH}:/nix/store/boost-1.83.0/lib; exec ./server"
