@@ -1,8 +1,8 @@
 [dependencies]
-nixPkgs = ["bun", "boost183"]
+nixPkgs = ["bun", "boost"]
 
 [phases.install]
-cmds = ["bun install", "echo /nix/store/boost-1.83.0/lib", "ls -l /nix/store/boost-1.83.0/lib/libboost_iostreams.so.1.83.0", "ldd ./innoextract | grep -i boost", "echo \"$LD_LIBRARY_PATH\""]
+cmds = ["bun install""]
 
 [phases.build]
 cmds = ["bun run build"]
