@@ -1,25 +1,16 @@
 [dependencies]
-
 nixPkgs = ["bun", "boost183", "patchelf"]
 
 [phases.install]
-
 cmds = [
-
-"bun install",
-
-"BOOST_LIB=$(echo /nix/store/boost-1.83.0/lib)",
-
-"patchelf --set-rpath "$BOOST_LIB" ./innoextract",
-
-"patchelf --set-rpath "$BOOST_LIB" ./server || true"
-
+    "bun install",
+    "BOOST_LIB=$(echo /nix/store/boost-1.83.0/lib)",
+    "patchelf --set-rpath \"$BOOST_LIB\" ./innoextract",
+    "patchelf --set-rpath \"$BOOST_LIB\" ./server || true"
 ]
 
 [phases.build]
-
 cmds = ["bun run build"]
 
 [start]
-
 cmd = "./server"
