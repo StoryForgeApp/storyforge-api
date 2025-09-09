@@ -1,8 +1,40 @@
 import { Elysia } from "elysia";
 import dotenv from "dotenv";
 import * as cheerio from "cheerio";
+import { S3Client, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { tmpdir } from "node:os";
+import { mkdtemp, rm, mkdir, stat, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { createWriteStream } from "node:fs";
+import { spawn } from "node:child_process";
+import { pipeline } from "node:stream/promises";
+import cron, { Patterns } from "@elysiajs/cron";
 
+// ---------- config ----------
 dotenv.config();
+
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID!;
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
+const R2_BUCKET = process.env.R2_BUCKET!; // e.g., "my-game"
+const R2_PUBLIC_BASE = process.env.R2_PUBLIC_BASE!; // e.g., "https://cdn.example.com/game"
+const INNOEXTRACT_BIN = process.env.INNOEXTRACT_BIN || "./innoextract";
+
+if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET || !R2_PUBLIC_BASE) {
+  throw new Error("Missing R2_* env vars");
+}
+
+const s3 = new S3Client({
+  region: "auto",
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: R2_ACCESS_KEY_ID,
+    secretAccessKey: R2_SECRET_ACCESS_KEY,
+  },
+});
+
+// Minimal cache to avoid duplicate builds within process lifetime
+const builtCache = new Map<string, string>(); // version -> public URL
 
 type DownloadLinks = {
   windows: string | null;
@@ -12,6 +44,7 @@ type DownloadLinks = {
   windows_server: string | null;
 };
 
+// Your existing parser functions here (parseVintageStoryDownloads, etc.)
 /**
  * Parse Vintage Story download links from an account downloads HTML page.
  *
@@ -198,10 +231,164 @@ function classifySlotFromHref(href: string): keyof DownloadLinks | null {
   return null;
 }
 
-const app = new Elysia().get("/", async () => {
-  return await parseVintageStoryDownloads("https://account.vintagestory.at/");
-}).listen(3000);
+// -------------- helpers --------------
+async function r2Head(key: string): Promise<boolean> {
+  try {
+    await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+    return true;
+  } catch (e: any) {
+    if (e.$metadata?.httpStatusCode === 404) return false;
+    return false;
+  }
+}
 
-console.log(
-  `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
-);
+async function r2Put(key: string, body: Buffer | Uint8Array, contentType: string, cacheControl?: string) {
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: contentType,
+      CacheControl: cacheControl,
+    })
+  );
+}
+
+function publicUrlFor(key: string) {
+  // If you mapped bucket root to R2_PUBLIC_BASE, join path
+  return `${R2_PUBLIC_BASE.replace(/\/+$/, "")}/${key.replace(/^\/+/, "")}`;
+}
+
+async function downloadToFile(url: string, outPath: string) {
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok || !res.body) {
+    throw new Error(`Failed to download ${url}: ${res.status} ${res.statusText}`);
+  }
+  const file = createWriteStream(outPath);
+  await pipeline(res.body as any, file);
+}
+
+async function run(cmd: string, args: string[], opts: { cwd?: string } = {}) {
+  await new Promise<void>((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: "inherit", cwd: opts.cwd });
+    p.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${cmd} exited with code ${code}`));
+    });
+    p.on("error", reject);
+  });
+}
+
+// Zip directory contents into zipPath
+async function zipDirectory(srcDir: string, zipPath: string) {
+  // Use system zip for Windows-friendliness; zips the contents (.) into archive
+  await run("zip", ["-r", "-9", zipPath, "."], { cwd: srcDir });
+}
+
+function windowsZipKey(version: string): string {
+  return `${version}/windows.zip`; // path layout in bucket
+}
+
+// Core: ensure windows zip exists in R2 for a version, building if needed
+async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise<string> {
+  if (builtCache.has(version)) return builtCache.get(version)!;
+
+  const key = windowsZipKey(version);
+  const exists = await r2Head(key);
+  if (exists) {
+    const url = publicUrlFor(key);
+    builtCache.set(version, url);
+    return url;
+  }
+
+  // Build on demand
+  const workDir = await mkdtemp(join(tmpdir(), `vs-${version}-`));
+  try {
+    const exePath = join(workDir, `installer-${version}.exe`);
+    const extractDir = join(workDir, "extracted");
+    const zipPath = join(workDir, "windows.zip");
+
+    await downloadToFile(windowsExeUrl, exePath);
+    await mkdir(extractDir, { recursive: true });
+
+    // Extract
+    await run(INNOEXTRACT_BIN, ["--output-dir", extractDir, exePath]);
+
+    // Optional: sanity check at least one file
+    try {
+      await stat(extractDir);
+    } catch {
+      throw new Error("Extraction failed: no output directory");
+    }
+
+    // Zip contents
+    await zipDirectory(extractDir, zipPath);
+
+    // Upload to R2
+    const zipData = await readFile(zipPath);
+    await r2Put(key, zipData, "application/zip", "public, max-age=31536000, immutable");
+
+    const url = publicUrlFor(key);
+    builtCache.set(version, url);
+    return url;
+  } finally {
+    // Clean temp directory
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
+// Get latest versions + resolve Windows zip URL (R2 or build-on-demand)
+async function getVersionsWithResolvedWindowsZip(sourceUrl: string) {
+  const versions = await parseVintageStoryDownloads(sourceUrl);
+  // Build a normalized output structure
+  const out: Record<
+    string,
+    DownloadLinks & { windows_zip?: string | null }
+  > = {};
+
+  for (const [version, links] of Object.entries(versions)) {
+    out[version] = { ...links, windows_zip: null };
+
+    // We only act if we have a Windows installer link to transform
+    if (links.windows && /\.exe(\?|$)/i.test(links.windows)) {
+      try {
+        const r2Url = await ensureWindowsZip(version, links.windows);
+        out[version].windows_zip = r2Url;
+      } catch (e) {
+        console.error(`Failed to build windows zip for ${version}:`, e);
+        // Leave windows_zip null; caller may fall back to installer if desired
+      }
+    } else if (links.windows && /\.zip(\?|$)/i.test(links.windows)) {
+      // In case upstream already provides zip
+      out[version].windows_zip = links.windows;
+    }
+  }
+  return out;
+}
+
+// -------------- routes --------------
+const app = new Elysia()
+  .use(cron({
+    name: "download-versions",
+    pattern: Patterns.EVERY_2_HOURS, // every 2 hours
+    run: async () => {
+      console.log(`[${new Date().toISOString()}] Cron job: refreshing versions and building missing zips`);
+      try {
+        await getVersionsWithResolvedWindowsZip("https://account.vintagestory.at/");
+        console.log(`[${new Date().toISOString()}] Cron job: completed successfully`);
+      } catch (e) {
+        console.error(`[${new Date().toISOString()}] Cron job: failed`, e);
+      }
+    }
+  }))
+  .get("/", async () => {
+    // Returns parsed links as-is
+    return await parseVintageStoryDownloads("https://account.vintagestory.at/");
+  })
+  .get("/resolved", async () => {
+    // Returns links with windows_zip resolved to your R2 URL (building if missing)
+    return await getVersionsWithResolvedWindowsZip("https://account.vintagestory.at/");
+  })
+  .listen(3000);
+
+console.log(`Elysia running at ${app.server?.hostname}:${app.server?.port}`);
