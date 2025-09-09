@@ -1,6 +1,9 @@
 [dependencies]
 nixPkgs = ["bun"]
 
+[phases.setup]
+nixpkgs = ["boost183"]
+
 [phases.install]
 cmds = ["bun install"]
 
