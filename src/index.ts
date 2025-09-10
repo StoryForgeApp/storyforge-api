@@ -470,12 +470,16 @@ const app = new Elysia()
       },
     })
   )
-  .get("/", async () => {
+  .get("/versions", async () => {
+    const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
+    return Object.keys(versions);
+  })
+  .get("/download", async () => {
     // Return parsed links plus any already-built windows zips in R2 (Redis cached)
     const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     return await mergeBuiltZips(versions);
   })
-  .get("/:version", async ({ params: { version } }) => {
+  .get("/download/:version", async ({ params: { version } }) => {
     const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     const v = versions[version];
     if (!v) {
@@ -488,7 +492,7 @@ const app = new Elysia()
       version: t.String()
     })
   })
-  .get("/:version/:platform", async ({ params: { version, platform } }) => {
+  .get("/download/:version/:platform", async ({ params: { version, platform } }) => {
     let versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     const v = versions[version];
     if (!v) {
