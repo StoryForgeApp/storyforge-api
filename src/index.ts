@@ -1,14 +1,23 @@
-import { Elysia } from "elysia";
+import { Elysia, t } from "elysia";
 import dotenv from "dotenv";
 import * as cheerio from "cheerio";
-import { S3Client, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  HeadObjectCommand,
+  PutObjectCommand,
+  ListObjectsV2Command,
+  ListObjectsV2CommandOutput,
+} from "@aws-sdk/client-s3";
 import { tmpdir } from "node:os";
-import { mkdtemp, rm, mkdir, stat, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, stat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createWriteStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import cron, { Patterns } from "@elysiajs/cron";
+import { JobLock } from "./jobLock";
+
+const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
 
 // ---------- config ----------
 dotenv.config();
@@ -217,11 +226,11 @@ function classifySlotFromHref(href: string): keyof DownloadLinks | null {
   }
 
   // Fallbacks by extension+platform hints
-  if (/linux/.test(h) && /\.tar\.gz$/.test(h)) {
+  if (/linux/.test(h) && h.endsWith(".tar.gz")) {
     // If "server" didn’t match earlier, assume client
     return "linux";
   }
-  if (/win/.test(h) && /\.exe$/.test(h)) {
+  if (/win/.test(h) && h.endsWith(".exe")) {
     return "windows";
   }
   if (/win.*\.zip$/.test(h) && /server/.test(h)) {
@@ -366,29 +375,138 @@ async function getVersionsWithResolvedWindowsZip(sourceUrl: string) {
   return out;
 }
 
-// -------------- routes --------------
-const app = new Elysia()
-  .use(cron({
-    name: "download-versions",
-    pattern: Patterns.EVERY_2_HOURS, // every 2 hours
-    run: async () => {
-      console.log(`[${new Date().toISOString()}] Cron job: refreshing versions and building missing zips`);
-      try {
-        await getVersionsWithResolvedWindowsZip("https://account.vintagestory.at/");
-        console.log(`[${new Date().toISOString()}] Cron job: completed successfully`);
-      } catch (e) {
-        console.error(`[${new Date().toISOString()}] Cron job: failed`, e);
+// List all already-built windows zips from R2: returns Map<version, publicUrl>
+async function listBuiltWindowsZipsFromR2(): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  let ContinuationToken: string | undefined = undefined;
+  do {
+    const resp: ListObjectsV2CommandOutput = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: R2_BUCKET,
+        ContinuationToken,
+      })
+    );
+    for (const obj of resp.Contents ?? []) {
+      const key = obj.Key || "";
+      // Expect keys like "<version>/windows.zip"
+      if (/^[^/]+\/windows\.zip$/i.test(key)) {
+        const version = key.split("/", 1)[0];
+        out.set(version, publicUrlFor(key));
+        // also prime local cache
+        builtCache.set(version, publicUrlFor(key));
       }
     }
-  }))
+    ContinuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (ContinuationToken);
+  return out;
+}
+
+ // Merge already-built zips into parsed versions without triggering builds
+async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
+  const built = await listBuiltWindowsZipsFromR2();
+  const out: Record<string, DownloadLinks> =
+    {};
+  for (const [version, links] of Object.entries(versions)) {
+    out[version] = { ...links, windows: null };
+    const builtUrl = built.get(version);
+    if (builtUrl) {
+      out[version].windows = builtUrl;
+    } else if (links.windows && /\.zip(\?|$)/i.test(links.windows)) {
+      // upstream-provided zip (rare), surface it too
+      out[version].windows = links.windows;
+    }
+  }
+  return out;
+}
+
+// -------------- routes --------------
+const app = new Elysia()
+  .use(
+    cron({
+      name: "download-versions",
+      pattern: Patterns.EVERY_2_HOURS,
+      run: async () => {
+        if (buildLock.isLocked) {
+          console.log(`[${new Date().toISOString()}] Cron: skipped (job already running)`);
+          return;
+        }
+        const release = await buildLock.acquire();
+        console.log(
+          `[${new Date().toISOString()}] Cron: start refreshing versions and building missing zips`
+        );
+        try {
+          await getVersionsWithResolvedWindowsZip("https://account.vintagestory.at/");
+          console.log(`[${new Date().toISOString()}] Cron: completed`);
+        } catch (e) {
+          console.error(`[${new Date().toISOString()}] Cron: failed`, e);
+        } finally {
+          release();
+        }
+      },
+    })
+  )
   .get("/", async () => {
-    // Returns parsed links as-is
-    return await parseVintageStoryDownloads("https://account.vintagestory.at/");
+    // Return parsed links plus any already-built windows zips in R2
+    const versions = await parseVintageStoryDownloads(
+      "https://account.vintagestory.at/"
+    );
+    return await mergeBuiltZips(versions);
   })
-  .get("/resolved", async () => {
-    // Returns links with windows_zip resolved to your R2 URL (building if missing)
-    return await getVersionsWithResolvedWindowsZip("https://account.vintagestory.at/");
+  .get("/:version", async ({ params: { version } }) => {
+    const versions = await parseVintageStoryDownloads(
+      "https://account.vintagestory.at/"
+    );
+    const v = versions[version];
+    if (!v) {
+      return { error: "Version not found" };
+    }
+    const merged = await mergeBuiltZips({ [version]: v });
+    return merged[version];
+  }, {
+    params: t.Object({
+      version: t.String()
+    })
   })
-  .listen(3000);
+  .get("/:version/:platform", async ({ params: { version, platform } }) => {
+    let versions = await parseVintageStoryDownloads(
+      "https://account.vintagestory.at/"
+    );
+    const v = versions[version];
+    if (!v) {
+      return { error: "Version not found" };
+    }
+    if (platform === "windows") {
+      versions = await mergeBuiltZips({ [version]: v });
+    }
+    if (!(platform in v)) {
+      return { error: "Invalid platform" };
+    }
+    return { url: versions[version][platform] };
+  }, {
+    params: t.Object({
+      version: t.String(),
+      platform: t.Enum({
+        windows: "windows",
+        mac: "mac",
+        linux: "linux",
+        linux_server: "linux_server",
+        windows_server: "windows_server"
+      })
+    })
+  })
+  .get("/resolved", async ({ set, store: { cron } }) => {
+    if (buildLock.isLocked) {
+      set.status = 409;
+      return { ok: false, message: "Build is already running" };
+    }
+    try {
+      await cron["download-versions"].trigger();
+      return { ok: true, message: "Build started in background" };
+    } catch (e) {
+      set.status = 500;
+      return { ok: false, message: (e as Error).message };
+    }
+  })
+  .listen(3050);
 
 console.log(`Elysia running at ${app.server?.hostname}:${app.server?.port}`);
