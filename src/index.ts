@@ -460,9 +460,7 @@ const app = new Elysia()
           `[${new Date().toISOString()}] Cron: start refreshing versions and building missing zips`
         );
         try {
-          // Refresh versions and builtzips in Redis
-          const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
-          await listBuiltWindowsZipsFromR2();
+          await getVersionsWithResolvedWindowsZip("https://account.vintagestory.at/");
           console.log(`[${new Date().toISOString()}] Cron: completed`);
         } catch (e) {
           console.error(`[${new Date().toISOString()}] Cron: failed`, e);
