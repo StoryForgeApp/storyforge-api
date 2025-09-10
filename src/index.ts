@@ -1,4 +1,5 @@
 import { Elysia, t } from "elysia";
+import Redis from "ioredis";
 import dotenv from "dotenv";
 import * as cheerio from "cheerio";
 import {
@@ -28,9 +29,10 @@ const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
 const R2_BUCKET = process.env.R2_BUCKET!; // e.g., "my-game"
 const R2_PUBLIC_BASE = process.env.R2_PUBLIC_BASE!; // e.g., "https://cdn.example.com/game"
 const INNOEXTRACT_BIN = process.env.INNOEXTRACT_BIN || "./innoextract";
+const REDIS_URL = process.env.REDIS_URL || undefined;
 
-if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET || !R2_PUBLIC_BASE) {
-  throw new Error("Missing R2_* env vars");
+if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET || !R2_PUBLIC_BASE || !REDIS_URL) {
+  throw new Error("Missing R2_* and REDIS_URL env vars");
 }
 
 const s3 = new S3Client({
@@ -44,6 +46,9 @@ const s3 = new S3Client({
 
 // Minimal cache to avoid duplicate builds within process lifetime
 const builtCache = new Map<string, string>(); // version -> public URL
+
+// Redis setup
+const redis = new Redis(REDIS_URL);
 
 type DownloadLinks = {
   windows: string | null;
@@ -75,11 +80,22 @@ type DownloadLinks = {
  * - Robust to minor wording/size changes in anchor text; keys are inferred
  *   from href filename patterns.
  */
+
+// Redis-cached version list (1h TTL)
 export async function parseVintageStoryDownloads(url: string): Promise<{
   [version: string]: DownloadLinks;
 }> {
+  const cacheKey = "vsapi:versions";
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch {}
+  }
   const html = await fetchText(url);
-  return parseDownloadsFromHtml(html);
+  const parsed = parseDownloadsFromHtml(html);
+  await redis.set(cacheKey, JSON.stringify(parsed), "EX", 3600); // 1h
+  return parsed;
 }
 
 async function fetchText(url: string): Promise<string> {
@@ -375,8 +391,17 @@ async function getVersionsWithResolvedWindowsZip(sourceUrl: string) {
   return out;
 }
 
-// List all already-built windows zips from R2: returns Map<version, publicUrl>
+
+// Redis-cached built windows zips (1d TTL)
 async function listBuiltWindowsZipsFromR2(): Promise<Map<string, string>> {
+  const cacheKey = "vsapi:builtzips";
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    try {
+      const obj = JSON.parse(cached);
+      return new Map(Object.entries(obj));
+    } catch {}
+  }
   const out = new Map<string, string>();
   let ContinuationToken: string | undefined = undefined;
   do {
@@ -388,16 +413,16 @@ async function listBuiltWindowsZipsFromR2(): Promise<Map<string, string>> {
     );
     for (const obj of resp.Contents ?? []) {
       const key = obj.Key || "";
-      // Expect keys like "<version>/windows.zip"
       if (/^[^/]+\/windows\.zip$/i.test(key)) {
         const version = key.split("/", 1)[0];
         out.set(version, publicUrlFor(key));
-        // also prime local cache
         builtCache.set(version, publicUrlFor(key));
       }
     }
     ContinuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
   } while (ContinuationToken);
+  // Save to Redis
+  await redis.set(cacheKey, JSON.stringify(Object.fromEntries(out)), "EX", 604800); // 7d
   return out;
 }
 
@@ -435,7 +460,9 @@ const app = new Elysia()
           `[${new Date().toISOString()}] Cron: start refreshing versions and building missing zips`
         );
         try {
-          await getVersionsWithResolvedWindowsZip("https://account.vintagestory.at/");
+          // Refresh versions and builtzips in Redis
+          const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
+          await listBuiltWindowsZipsFromR2();
           console.log(`[${new Date().toISOString()}] Cron: completed`);
         } catch (e) {
           console.error(`[${new Date().toISOString()}] Cron: failed`, e);
@@ -446,16 +473,12 @@ const app = new Elysia()
     })
   )
   .get("/", async () => {
-    // Return parsed links plus any already-built windows zips in R2
-    const versions = await parseVintageStoryDownloads(
-      "https://account.vintagestory.at/"
-    );
+    // Return parsed links plus any already-built windows zips in R2 (Redis cached)
+    const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     return await mergeBuiltZips(versions);
   })
   .get("/:version", async ({ params: { version } }) => {
-    const versions = await parseVintageStoryDownloads(
-      "https://account.vintagestory.at/"
-    );
+    const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     const v = versions[version];
     if (!v) {
       return { error: "Version not found" };
@@ -468,9 +491,7 @@ const app = new Elysia()
     })
   })
   .get("/:version/:platform", async ({ params: { version, platform } }) => {
-    let versions = await parseVintageStoryDownloads(
-      "https://account.vintagestory.at/"
-    );
+    let versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     const v = versions[version];
     if (!v) {
       return { error: "Version not found" };
