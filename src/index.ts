@@ -393,8 +393,8 @@ async function getVersionsWithResolvedWindowsZip(sourceUrl: string) {
 
 
 // Redis-cached built windows zips (1d TTL)
-async function listBuiltWindowsZipsFromR2(): Promise<Map<string, string>> {
-  const cacheKey = "vsapi:builtzips";
+async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, string>> {
+  const cacheKey = "vsapi:builtzips:" + newest;
   const cached = await redis.get(cacheKey);
   if (cached) {
     try {
@@ -428,7 +428,8 @@ async function listBuiltWindowsZipsFromR2(): Promise<Map<string, string>> {
 
  // Merge already-built zips into parsed versions without triggering builds
 async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
-  const built = await listBuiltWindowsZipsFromR2();
+  const newest = Object.keys(versions)[0];
+  const built = await listBuiltWindowsZipsFromR2(newest);
   const out: Record<string, DownloadLinks> =
     {};
   for (const [version, links] of Object.entries(versions)) {
