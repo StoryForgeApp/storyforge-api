@@ -322,9 +322,9 @@ async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise
   const key = windowsZipKey(version);
   const exists = await r2Head(key);
   if (exists) {
-    console.log(`Found existing windows zip for ${version}`);
     const url = publicUrlFor(key);
     builtCache.set(version, url);
+    console.log(`Found existing windows zip for ${version} - ${url}`);
     return url;
   }
   console.log(`Building windows zip for ${version}...`);
@@ -403,6 +403,8 @@ async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, s
     console.log(`Cache hit for ${cacheKey}`);
     try {
       const obj = JSON.parse(cached);
+      const sorted = Object.keys(obj).sort(semver.order).reverse();
+      console.log(`Cached built zips for versions: ${sorted.join(", ")}`);
       return new Map(Object.entries(obj));
     } catch {}
   }
@@ -444,7 +446,7 @@ async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
     out[version] = { ...links, windows: null };
     const builtUrl = built.get(version);
     if (builtUrl) {
-      console.log(`Found existing windows zip for ${version}`);
+      console.log(`Found already existing windows zip for ${version}`);
       out[version].windows = builtUrl;
     } else if (links.windows && /\.zip(\?|$)/i.test(links.windows)) {
       // upstream-provided zip (rare), surface it too
