@@ -432,6 +432,7 @@ async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
   // Sort the versions from a semver perspective to get the newest
   const sorted = Object.keys(versions).sort(semver.order).reverse();
   const newest = sorted[0];
+  console.log(`Merging built zips, newest version detected: ${newest}`);
   const built = await listBuiltWindowsZipsFromR2(newest);
   const out: Record<string, DownloadLinks> =
     {};
