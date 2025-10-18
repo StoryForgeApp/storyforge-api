@@ -17,6 +17,7 @@ import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import cron, { Patterns } from "@elysiajs/cron";
 import { JobLock } from "./jobLock";
+import { semver } from "bun";
 
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
 
@@ -428,7 +429,9 @@ async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, s
 
  // Merge already-built zips into parsed versions without triggering builds
 async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
-  const newest = Object.keys(versions)[0];
+  // Sort the versions from a semver perspective to get the newest
+  const sorted = Object.keys(versions).sort(semver.order).reverse();
+  const newest = sorted[0];
   const built = await listBuiltWindowsZipsFromR2(newest);
   const out: Record<string, DownloadLinks> =
     {};
