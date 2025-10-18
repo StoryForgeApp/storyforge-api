@@ -322,10 +322,12 @@ async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise
   const key = windowsZipKey(version);
   const exists = await r2Head(key);
   if (exists) {
+    console.log(`Found existing windows zip for ${version}`);
     const url = publicUrlFor(key);
     builtCache.set(version, url);
     return url;
   }
+  console.log(`Building windows zip for ${version}...`);
 
   // Build on demand
   const workDir = await mkdtemp(join(tmpdir(), `vs-${version}-`));
@@ -398,11 +400,13 @@ async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, s
   const cacheKey = "vsapi:builtzips:" + newest;
   const cached = await redis.get(cacheKey);
   if (cached) {
+    console.log(`Cache hit for ${cacheKey}`);
     try {
       const obj = JSON.parse(cached);
       return new Map(Object.entries(obj));
     } catch {}
   }
+  console.log(`Cache miss for ${cacheKey}, listing R2 objects`);
   const out = new Map<string, string>();
   let ContinuationToken: string | undefined = undefined;
   do {
