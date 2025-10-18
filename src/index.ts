@@ -444,6 +444,7 @@ async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
     out[version] = { ...links, windows: null };
     const builtUrl = built.get(version);
     if (builtUrl) {
+      console.log(`Found existing windows zip for ${version}`);
       out[version].windows = builtUrl;
     } else if (links.windows && /\.zip(\?|$)/i.test(links.windows)) {
       // upstream-provided zip (rare), surface it too
