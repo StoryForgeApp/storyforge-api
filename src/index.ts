@@ -407,6 +407,10 @@ async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, s
       const obj = JSON.parse(cached);
       const sorted = Object.keys(obj).sort(semver.order).reverse();
       console.log(`Cached built zips for versions: ${sorted.join(", ")}`);
+      if (sorted[0] !== newest) {
+        console.log(`Warning: cached newest version ${sorted[0]} differs from expected ${newest}`);
+        throw new Error("Cache inconsistency");
+      }
       return new Map(Object.entries(obj));
     } catch {}
   }
