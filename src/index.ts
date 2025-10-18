@@ -389,6 +389,8 @@ async function getVersionsWithResolvedWindowsZip(sourceUrl: string) {
     } else if (links.windows && /\.zip(\?|$)/i.test(links.windows)) {
       // In case upstream already provides zip
       out[version].windows_zip = links.windows;
+    } else {
+      console.log(`No Windows installer link for ${version}, skipping windows zip build.`);
     }
   }
   return out;
