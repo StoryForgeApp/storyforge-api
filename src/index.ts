@@ -449,6 +449,8 @@ async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
     } else if (links.windows && /\.zip(\?|$)/i.test(links.windows)) {
       // upstream-provided zip (rare), surface it too
       out[version].windows = links.windows;
+    } else {
+      console.log(`No built windows zip for ${version}`);
     }
   }
   return out;
