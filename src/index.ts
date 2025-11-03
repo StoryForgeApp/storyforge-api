@@ -478,7 +478,7 @@ const app = new Elysia()
   })
   .get("/mods", async ({ query }) => {
     // Check in redis if we have cached mod list
-    const cacheKey = `vsapi:mods:${query.versions?.join(",") || "all"}`;
+    const cacheKey = `vsapi:mods:${query.versions || "all"}`;
     const cached = await redis.get(cacheKey);
     if (cached) {
       try {
@@ -488,7 +488,7 @@ const app = new Elysia()
 
     let fetchUrl = "https://mods.vintagestory.at/api/mods";
     if (query.versions) {
-      fetchUrl += `?gameversions=${encodeURIComponent(query.versions.join(","))}`;
+      fetchUrl += `?gameversions=${encodeURIComponent(query.versions)}`;
     }
 
     // Fetch and parse
@@ -504,7 +504,7 @@ const app = new Elysia()
     return mods;
   }, {
     query: t.Object({
-      versions: t.Optional(t.Array(t.String())),
+      versions: t.Optional(t.String()),
     })
   })
   .get("/modtags", async () => {
