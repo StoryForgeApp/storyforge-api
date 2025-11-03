@@ -18,6 +18,7 @@ import { pipeline } from "node:stream/promises";
 import cron, { Patterns } from "@elysiajs/cron";
 import { JobLock } from "./jobLock";
 import { semver } from "bun";
+import { cors } from "@elysiajs/cors";
 
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
 
@@ -466,6 +467,8 @@ async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
 
 // -------------- routes --------------
 const app = new Elysia()
+  // Enable CORS for all routes
+  .use(cors())
   .use(
     cron({
       name: "download-versions",
@@ -490,6 +493,67 @@ const app = new Elysia()
       },
     })
   )
+  .get("/mod/:modid", async ({ params: { modid }}) => {
+    const cacheKey = `vsapi:mod:${modid}`;
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      try {
+        return JSON.parse(cached);
+      } catch {}
+    }
+    const response = await fetch(`https://mods.vintagestory.at/api/mod/${modid}`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch mod ${modid}: ${response.status} ${response.statusText}`);
+    }
+    const mod = await response.json();
+    // Cache for 1 hour
+    await redis.set(cacheKey, JSON.stringify(mod), "EX", 3600);
+    return mod;
+  })
+  .get("/mods", async () => {
+    // Check in redis if we have cached mod list
+    const cacheKey = "vsapi:mods";
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      try {
+        return JSON.parse(cached);
+      } catch {}
+    }
+
+    // Fetch and parse
+    const response = await fetch("https://mods.vintagestory.at/api/mods");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch mods: ${response.status} ${response.statusText}`);
+    }
+    const mods = await response.json();
+
+    // Cache for 1 hour
+    await redis.set(cacheKey, JSON.stringify(mods), "EX", 3600);
+
+    return mods;
+  })
+  .get("/modtags", async () => {
+    // Check in redis if we have cached mod tags
+    const cacheKey = "vsapi:modtags";
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      try {
+        return JSON.parse(cached);
+      } catch {}
+    }
+
+    // Fetch and parse
+    const response = await fetch("https://mods.vintagestory.at/api/tags");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch mod tags: ${response.status} ${response.statusText}`);
+    }
+    const modtags = await response.json();
+
+    // Cache for 7 days
+    await redis.set(cacheKey, JSON.stringify(modtags), "EX", 604800);
+
+    return modtags;
+  })
   .get("/versions", async () => {
     const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     return Object.keys(versions);
