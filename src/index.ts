@@ -1,5 +1,4 @@
 import { Elysia, t } from "elysia";
-import dotenv from "dotenv";
 import * as cheerio from "cheerio";
 import {
   S3Client,
@@ -20,9 +19,6 @@ import { semver, redis } from "bun";
 import { cors } from "@elysiajs/cors";
 
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
-
-// ---------- config ----------
-dotenv.config();
 
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID!;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
