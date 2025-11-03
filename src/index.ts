@@ -1,12 +1,5 @@
 import { Elysia, t } from "elysia";
 import * as cheerio from "cheerio";
-import {
-  S3Client,
-  HeadObjectCommand,
-  PutObjectCommand,
-  ListObjectsV2Command,
-  ListObjectsV2CommandOutput,
-} from "@aws-sdk/client-s3";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm, mkdir, stat, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -15,7 +8,7 @@ import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import cron, { Patterns } from "@elysiajs/cron";
 import { JobLock } from "./jobLock";
-import { semver, redis } from "bun";
+import { semver, redis, S3Client } from "bun";
 import { cors } from "@elysiajs/cors";
 
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
@@ -33,12 +26,10 @@ if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET |
 }
 
 const s3 = new S3Client({
-  region: "auto",
   endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: R2_ACCESS_KEY_ID,
-    secretAccessKey: R2_SECRET_ACCESS_KEY,
-  },
+  secretAccessKey: R2_SECRET_ACCESS_KEY,
+  accessKeyId: R2_ACCESS_KEY_ID,
+  bucket: R2_BUCKET,
 });
 
 // Minimal cache to avoid duplicate builds within process lifetime
@@ -252,25 +243,14 @@ function classifySlotFromHref(href: string): keyof DownloadLinks | null {
 
 // -------------- helpers --------------
 async function r2Head(key: string): Promise<boolean> {
-  try {
-    await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key }));
-    return true;
-  } catch (e: any) {
-    if (e.$metadata?.httpStatusCode === 404) return false;
-    return false;
-  }
+  return s3.exists(key);
 }
 
-async function r2Put(key: string, body: Buffer | Uint8Array, contentType: string, cacheControl?: string) {
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: key,
-      Body: body,
-      ContentType: contentType,
-      CacheControl: cacheControl,
-    })
-  );
+async function r2Put(key: string, body: Buffer | Uint8Array, contentType: string, acl?: "private" | "public-read" | "public-read-write" | "aws-exec-read" | "authenticated-read" | "bucket-owner-read" | "bucket-owner-full-control" | "log-delivery-write" | undefined) {
+  await s3.write(key, body, {
+    type: contentType,
+    acl,
+  });
 }
 
 function publicUrlFor(key: string) {
@@ -347,7 +327,7 @@ async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise
 
     // Upload to R2
     const zipData = await readFile(zipPath);
-    await r2Put(key, zipData, "application/zip", "public, max-age=31536000, immutable");
+    await r2Put(key, zipData, "application/zip", "public-read");
 
     const url = publicUrlFor(key);
     builtCache.set(version, url);
@@ -411,21 +391,18 @@ async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, s
   const out = new Map<string, string>();
   let ContinuationToken: string | undefined = undefined;
   do {
-    const resp: ListObjectsV2CommandOutput = await s3.send(
-      new ListObjectsV2Command({
-        Bucket: R2_BUCKET,
-        ContinuationToken,
-      })
-    );
-    for (const obj of resp.Contents ?? []) {
-      const key = obj.Key || "";
+    const resp = await s3.list({
+      continuationToken: ContinuationToken,
+    });
+    for (const obj of resp.contents ?? []) {
+      const key = obj.key || "";
       if (/^[^/]+\/windows\.zip$/i.test(key)) {
         const version = key.split("/", 1)[0];
         out.set(version, publicUrlFor(key));
         builtCache.set(version, publicUrlFor(key));
       }
     }
-    ContinuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+    ContinuationToken = resp.isTruncated ? resp.nextContinuationToken : undefined;
   } while (ContinuationToken);
   // Save to Redis
   await redis.set(cacheKey, JSON.stringify(Object.fromEntries(out)), "EX", 604800); // 7d
