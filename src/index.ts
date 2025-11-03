@@ -488,7 +488,7 @@ const app = new Elysia()
 
     let fetchUrl = "https://mods.vintagestory.at/api/mods";
     if (query.versions) {
-      fetchUrl += `?versions=${query.versions}`;
+      fetchUrl += `?${query.versions.split(",").map((v) => `gameversions[]=${v}`).join("&")}`;
     }
 
     // Fetch and parse
