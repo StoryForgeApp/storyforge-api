@@ -1,5 +1,4 @@
 import { Elysia, t } from "elysia";
-import Redis from "ioredis";
 import dotenv from "dotenv";
 import * as cheerio from "cheerio";
 import {
@@ -17,7 +16,7 @@ import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import cron, { Patterns } from "@elysiajs/cron";
 import { JobLock } from "./jobLock";
-import { semver } from "bun";
+import { semver, redis } from "bun";
 import { cors } from "@elysiajs/cors";
 
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
@@ -48,9 +47,6 @@ const s3 = new S3Client({
 
 // Minimal cache to avoid duplicate builds within process lifetime
 const builtCache = new Map<string, string>(); // version -> public URL
-
-// Redis setup
-const redis = new Redis(REDIS_URL);
 
 type DownloadLinks = {
   windows: string | null;
