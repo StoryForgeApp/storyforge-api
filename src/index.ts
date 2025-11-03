@@ -3,12 +3,9 @@ import * as cheerio from "cheerio";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm, mkdir, stat, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createWriteStream } from "node:fs";
-import { spawn } from "node:child_process";
-import { pipeline } from "node:stream/promises";
 import cron, { Patterns } from "@elysiajs/cron";
 import { JobLock } from "./jobLock";
-import { semver, redis, S3Client } from "bun";
+import { semver, redis } from "bun";
 import { cors } from "@elysiajs/cors";
 
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
@@ -25,7 +22,7 @@ if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET |
   throw new Error("Missing R2_* and REDIS_URL env vars");
 }
 
-const s3 = new S3Client({
+const s3 = new Bun.S3Client({
   endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   secretAccessKey: R2_SECRET_ACCESS_KEY,
   accessKeyId: R2_ACCESS_KEY_ID,
@@ -75,7 +72,7 @@ export async function parseVintageStoryDownloads(url: string): Promise<{
   if (cached) {
     try {
       return JSON.parse(cached);
-    } catch {}
+    } catch { }
   }
   const html = await fetchText(url);
   const parsed = parseDownloadsFromHtml(html);
@@ -263,19 +260,19 @@ async function downloadToFile(url: string, outPath: string) {
   if (!res.ok || !res.body) {
     throw new Error(`Failed to download ${url}: ${res.status} ${res.statusText}`);
   }
-  const file = createWriteStream(outPath);
-  await pipeline(res.body as any, file);
+  const arrayBuffer = await res.arrayBuffer();
+  await Bun.write(outPath, new Uint8Array(arrayBuffer));
 }
 
 async function run(cmd: string, args: string[], opts: { cwd?: string } = {}) {
-  await new Promise<void>((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: "inherit", cwd: opts.cwd });
-    p.on("exit", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} exited with code ${code}`));
-    });
-    p.on("error", reject);
+  const p = Bun.spawn([cmd, ...args], {
+    cwd: opts.cwd, stderr: "inherit", stdin: "inherit", stdout: "inherit", onExit: (_p, code) => {
+      if (code !== 0) {
+        throw new Error(`Command failed: ${cmd} ${args.join(" ")} (exit code ${code})`);
+      }
+    }
   });
+  return p.exited;
 }
 
 // Zip directory contents into zipPath
@@ -385,7 +382,7 @@ async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, s
         throw new Error("Cache inconsistency");
       }
       return new Map(Object.entries(obj));
-    } catch {}
+    } catch { }
   }
   console.log(`Cache miss for ${cacheKey}, listing R2 objects`);
   const out = new Map<string, string>();
@@ -409,7 +406,7 @@ async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, s
   return out;
 }
 
- // Merge already-built zips into parsed versions without triggering builds
+// Merge already-built zips into parsed versions without triggering builds
 async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
   // Sort the versions from a semver perspective to get the newest
   const sorted = Object.keys(versions).sort(semver.order).reverse();
@@ -462,13 +459,13 @@ const app = new Elysia()
       },
     })
   )
-  .get("/mod/:modid", async ({ params: { modid }}) => {
+  .get("/mod/:modid", async ({ params: { modid } }) => {
     const cacheKey = `vsapi:mod:${modid}`;
     const cached = await redis.get(cacheKey);
     if (cached) {
       try {
         return JSON.parse(cached);
-      } catch {}
+      } catch { }
     }
     const response = await fetch(`https://mods.vintagestory.at/api/mod/${modid}`);
     if (!response.ok) {
@@ -486,7 +483,7 @@ const app = new Elysia()
     if (cached) {
       try {
         return JSON.parse(cached);
-      } catch {}
+      } catch { }
     }
 
     // Fetch and parse
@@ -508,7 +505,7 @@ const app = new Elysia()
     if (cached) {
       try {
         return JSON.parse(cached);
-      } catch {}
+      } catch { }
     }
 
     // Fetch and parse
