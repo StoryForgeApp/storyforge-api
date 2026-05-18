@@ -5,6 +5,7 @@ import { mkdtemp, rm, mkdir, stat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import cron, { Patterns } from "@elysiajs/cron";
 import { JobLock } from "./jobLock";
+import { queryServer } from "./vsquery";
 import { semver, redis } from "bun";
 import { cors } from "@elysiajs/cors";
 
@@ -575,6 +576,37 @@ const app = new Elysia()
         windows_server: "windows_server"
       })
     })
+  })
+  .get("/query/:address", async ({ params: { address }, query }) => {
+    let host = address;
+    let port = 42420;
+
+    // Parse host:port from address
+    if (!host.startsWith("[")) {
+      const parts = host.split(":");
+      if (parts.length > 1) {
+        const maybePort = parseInt(parts[parts.length - 1], 10);
+        if (!isNaN(maybePort) && maybePort > 0 && maybePort <= 65535) {
+          port = maybePort;
+          host = parts.slice(0, -1).join(":");
+        }
+      }
+    }
+
+    const password = query.password || "";
+    const timeout = query.timeout ? parseInt(query.timeout, 10) : 8000;
+
+    const result = await queryServer(host, port, timeout, password);
+    const passwordResult = await queryServer(host, port, timeout, password, result.serverGameVersion, result.serverNetworkVersion)
+    return { ...result, ...passwordResult };
+  }, {
+    params: t.Object({
+      address: t.String(),
+    }),
+    query: t.Object({
+      password: t.Optional(t.String()),
+      timeout: t.Optional(t.String()),
+    }),
   })
   .get("/resolved", async ({ set, store: { cron } }) => {
     if (buildLock.isLocked) {
