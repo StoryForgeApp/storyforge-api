@@ -5,8 +5,24 @@ import { mkdtemp, rm, mkdir, stat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import cron, { Patterns } from "@elysiajs/cron";
 import { JobLock } from "./jobLock";
+import { queryServer } from "./vsquery";
 import { semver, redis } from "bun";
 import { cors } from "@elysiajs/cors";
+
+// ─── Rate limiter ───────────────────────────────────────────────────
+
+const QUERY_RATE_LIMIT = 5;       // requests per window
+const QUERY_RATE_WINDOW = 60;     // seconds
+
+async function checkRateLimit(ip: string): Promise<{ allowed: boolean; remaining: number; reset: number }> {
+  const key = `ratelimit:query:${ip}`;
+  const count = await redis.incr(key);
+  if (count === 1) {
+    await redis.expire(key, QUERY_RATE_WINDOW);
+  }
+  const remaining = Math.max(0, QUERY_RATE_LIMIT - count);
+  return { allowed: count <= QUERY_RATE_LIMIT, remaining, reset: QUERY_RATE_WINDOW };
+}
 
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
 
@@ -575,6 +591,50 @@ const app = new Elysia()
         windows_server: "windows_server"
       })
     })
+  })
+  .get("/query/:address", async ({ request, params: { address }, query, set }) => {
+    // Rate limit
+    const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+      || request.headers.get("x-real-ip")
+      || "unknown";
+    const rl = await checkRateLimit(ip);
+    set.headers["X-RateLimit-Limit"] = String(QUERY_RATE_LIMIT);
+    set.headers["X-RateLimit-Remaining"] = String(rl.remaining);
+    set.headers["X-RateLimit-Reset"] = String(rl.reset);
+    if (!rl.allowed) {
+      set.status = 429;
+      return { error: "Too many requests", retryAfter: rl.reset };
+    }
+
+    let host = address;
+    let port = 42420;
+
+    // Parse host:port from address
+    if (!host.startsWith("[")) {
+      const parts = host.split(":");
+      if (parts.length > 1) {
+        const maybePort = parseInt(parts[parts.length - 1], 10);
+        if (!isNaN(maybePort) && maybePort > 0 && maybePort <= 65535) {
+          port = maybePort;
+          host = parts.slice(0, -1).join(":");
+        }
+      }
+    }
+
+    const password = query.password || "";
+    const timeout = query.timeout ? parseInt(query.timeout, 10) : 8000;
+
+    const result = await queryServer(host, port, timeout, password);
+    const passwordResult = await queryServer(host, port, timeout, password, result.serverGameVersion, result.serverNetworkVersion)
+    return { ...result, ...passwordResult };
+  }, {
+    params: t.Object({
+      address: t.String(),
+    }),
+    query: t.Object({
+      password: t.Optional(t.String()),
+      timeout: t.Optional(t.String()),
+    }),
   })
   .get("/resolved", async ({ set, store: { cron } }) => {
     if (buildLock.isLocked) {
