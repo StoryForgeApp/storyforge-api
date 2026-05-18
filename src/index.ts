@@ -9,6 +9,21 @@ import { queryServer } from "./vsquery";
 import { semver, redis } from "bun";
 import { cors } from "@elysiajs/cors";
 
+// ─── Rate limiter ───────────────────────────────────────────────────
+
+const QUERY_RATE_LIMIT = 5;       // requests per window
+const QUERY_RATE_WINDOW = 60;     // seconds
+
+async function checkRateLimit(ip: string): Promise<{ allowed: boolean; remaining: number; reset: number }> {
+  const key = `ratelimit:query:${ip}`;
+  const count = await redis.incr(key);
+  if (count === 1) {
+    await redis.expire(key, QUERY_RATE_WINDOW);
+  }
+  const remaining = Math.max(0, QUERY_RATE_LIMIT - count);
+  return { allowed: count <= QUERY_RATE_LIMIT, remaining, reset: QUERY_RATE_WINDOW };
+}
+
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
 
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID!;
@@ -577,7 +592,20 @@ const app = new Elysia()
       })
     })
   })
-  .get("/query/:address", async ({ params: { address }, query }) => {
+  .get("/query/:address", async ({ request, params: { address }, query, set }) => {
+    // Rate limit
+    const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+      || request.headers.get("x-real-ip")
+      || "unknown";
+    const rl = await checkRateLimit(ip);
+    set.headers["X-RateLimit-Limit"] = String(QUERY_RATE_LIMIT);
+    set.headers["X-RateLimit-Remaining"] = String(rl.remaining);
+    set.headers["X-RateLimit-Reset"] = String(rl.reset);
+    if (!rl.allowed) {
+      set.status = 429;
+      return { error: "Too many requests", retryAfter: rl.reset };
+    }
+
     let host = address;
     let port = 42420;
 
