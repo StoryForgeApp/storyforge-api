@@ -17,7 +17,7 @@ COPY innoextract ./innoextract
 RUN chmod +x innoextract
 
 # Install dependencies and build, then clean bun cache
-RUN bun install && bun run build && rm -rf node_modules
+RUN bun install && bun run build
 
 EXPOSE 3050
 
