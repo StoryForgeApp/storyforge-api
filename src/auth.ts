@@ -8,6 +8,7 @@ import {
   organization,
   admin,
   username,
+  bearer,
 } from "better-auth/plugins";
 import { socialProviders } from "./auth/socialProviders";
 import { configuredProviders } from "./auth/providers";
@@ -32,6 +33,7 @@ export const auth = betterAuth({
     admin(),
     socialProviders(),
     username(),
+    bearer(),
     modpacks,
   ],
 });
