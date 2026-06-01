@@ -1,0 +1,1 @@
+ALTER TABLE `modpack_version` ADD `game_version` text;
