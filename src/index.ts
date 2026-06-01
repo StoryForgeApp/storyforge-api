@@ -8,13 +8,19 @@ import { JobLock } from "./jobLock";
 import { queryServer } from "./vsquery";
 import { semver, redis } from "bun";
 import { cors } from "@elysiajs/cors";
+import { auth } from "./auth";
+import { db } from "./db";
+import { modpack } from "./db/schema";
+import { eq } from "drizzle-orm";
 
 // ─── Rate limiter ───────────────────────────────────────────────────
 
-const QUERY_RATE_LIMIT = 5;       // requests per window
-const QUERY_RATE_WINDOW = 60;     // seconds
+const QUERY_RATE_LIMIT = 5; // requests per window
+const QUERY_RATE_WINDOW = 60; // seconds
 
-async function checkRateLimit(ip: string): Promise<{ allowed: boolean; remaining: number; reset: number }> {
+async function checkRateLimit(
+  ip: string,
+): Promise<{ allowed: boolean; remaining: number; reset: number }> {
   const key = `ratelimit:query:${ip}`;
   const count = await redis.incr(key);
   if (count === 1) {
@@ -26,15 +32,22 @@ async function checkRateLimit(ip: string): Promise<{ allowed: boolean; remaining
 
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
 
-const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID!;
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID!;
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY!;
-const R2_BUCKET = process.env.R2_BUCKET!; // e.g., "my-game"
-const R2_PUBLIC_BASE = process.env.R2_PUBLIC_BASE!; // e.g., "https://cdn.example.com/game"
-const INNOEXTRACT_BIN = process.env.INNOEXTRACT_BIN || "./innoextract";
-const REDIS_URL = process.env.REDIS_URL || undefined;
+const R2_ACCOUNT_ID = Bun.env.R2_ACCOUNT_ID!;
+const R2_ACCESS_KEY_ID = Bun.env.R2_ACCESS_KEY_ID!;
+const R2_SECRET_ACCESS_KEY = Bun.env.R2_SECRET_ACCESS_KEY!;
+const R2_BUCKET = Bun.env.R2_BUCKET!; // e.g., "my-game"
+const R2_PUBLIC_BASE = Bun.env.R2_PUBLIC_BASE!; // e.g., "https://cdn.example.com/game"
+const INNOEXTRACT_BIN = Bun.env.INNOEXTRACT_BIN || "./innoextract";
+const REDIS_URL = Bun.env.REDIS_URL || undefined;
 
-if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET || !R2_PUBLIC_BASE || !REDIS_URL) {
+if (
+  !R2_ACCOUNT_ID ||
+  !R2_ACCESS_KEY_ID ||
+  !R2_SECRET_ACCESS_KEY ||
+  !R2_BUCKET ||
+  !R2_PUBLIC_BASE ||
+  !REDIS_URL
+) {
   throw new Error("Missing R2_* and REDIS_URL env vars");
 }
 
@@ -88,7 +101,7 @@ export async function parseVintageStoryDownloads(url: string): Promise<{
   if (cached) {
     try {
       return JSON.parse(cached);
-    } catch { }
+    } catch {}
   }
   const html = await fetchText(url);
   const parsed = parseDownloadsFromHtml(html);
@@ -100,8 +113,8 @@ async function fetchText(url: string): Promise<string> {
   const res = await fetch(url, {
     headers: {
       "User-Agent": "Mozilla/5.0 (compatible; VintageStoryDownloadParser/1.0)",
-      "Cookie": `PHPSESSID=${process.env.PHPSESSID}; vs_websessionkey=${process.env.VS_WEBSESSIONKEY};`
-    }
+      Cookie: `PHPSESSID=${Bun.env.PHPSESSID}; vs_websessionkey=${Bun.env.VS_WEBSESSIONKEY};`,
+    },
   });
   if (!res.ok) {
     throw new Error(`Failed to fetch ${url}: ${res.status} ${res.statusText}`);
@@ -167,9 +180,7 @@ export function parseDownloadsFromHtml(html: string) {
           versions[version][slot] = href;
         } else {
           const currentIsCdn = /cdn\.vintagestory\.at/i.test(current);
-          const currentIsMirror = /account\.vintagestory\.at\/files/i.test(
-            current
-          );
+          const currentIsMirror = /account\.vintagestory\.at\/files/i.test(current);
           if (isCdn && currentIsMirror) {
             versions[version][slot] = href; // prefer CDN over mirror
           } else if (isMirror && !currentIsCdn) {
@@ -259,7 +270,21 @@ async function r2Head(key: string): Promise<boolean> {
   return s3.exists(key);
 }
 
-async function r2Put(key: string, body: Buffer | Uint8Array, contentType: string, acl?: "private" | "public-read" | "public-read-write" | "aws-exec-read" | "authenticated-read" | "bucket-owner-read" | "bucket-owner-full-control" | "log-delivery-write" | undefined) {
+async function r2Put(
+  key: string,
+  body: Buffer | Uint8Array,
+  contentType: string,
+  acl?:
+    | "private"
+    | "public-read"
+    | "public-read-write"
+    | "aws-exec-read"
+    | "authenticated-read"
+    | "bucket-owner-read"
+    | "bucket-owner-full-control"
+    | "log-delivery-write"
+    | undefined,
+) {
   await s3.write(key, body, {
     type: contentType,
     acl,
@@ -282,11 +307,15 @@ async function downloadToFile(url: string, outPath: string) {
 
 async function run(cmd: string, args: string[], opts: { cwd?: string } = {}) {
   const p = Bun.spawn([cmd, ...args], {
-    cwd: opts.cwd, stderr: "inherit", stdin: "inherit", stdout: "inherit", onExit: (_p, code) => {
+    cwd: opts.cwd,
+    stderr: "inherit",
+    stdin: "inherit",
+    stdout: "inherit",
+    onExit: (_p, code) => {
       if (code !== 0) {
         throw new Error(`Command failed: ${cmd} ${args.join(" ")} (exit code ${code})`);
       }
-    }
+    },
   });
   return p.exited;
 }
@@ -355,10 +384,7 @@ async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise
 async function getVersionsWithResolvedWindowsZip(sourceUrl: string) {
   const versions = await parseVintageStoryDownloads(sourceUrl);
   // Build a normalized output structure
-  const out: Record<
-    string,
-    DownloadLinks & { windows_zip?: string | null }
-  > = {};
+  const out: Record<string, DownloadLinks & { windows_zip?: string | null }> = {};
 
   for (const [version, links] of Object.entries(versions)) {
     out[version] = { ...links, windows_zip: null };
@@ -382,7 +408,6 @@ async function getVersionsWithResolvedWindowsZip(sourceUrl: string) {
   return out;
 }
 
-
 // Redis-cached built windows zips (1d TTL)
 async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, string>> {
   const cacheKey = "vsapi:builtzips:" + newest;
@@ -398,7 +423,7 @@ async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, s
         throw new Error("Cache inconsistency");
       }
       return new Map(Object.entries(obj));
-    } catch { }
+    } catch {}
   }
   console.log(`Cache miss for ${cacheKey}, listing R2 objects`);
   const out = new Map<string, string>();
@@ -429,8 +454,7 @@ async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
   const newest = sorted[0];
   console.log(`Merging built zips, newest version detected: ${newest}`);
   const built = await listBuiltWindowsZipsFromR2(newest);
-  const out: Record<string, DownloadLinks> =
-    {};
+  const out: Record<string, DownloadLinks> = {};
   for (const [version, links] of Object.entries(versions)) {
     out[version] = { ...links, windows: null };
     const builtUrl = built.get(version);
@@ -451,6 +475,7 @@ async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
 const app = new Elysia()
   // Enable CORS for all routes
   .use(cors())
+  .mount(auth.handler)
   .use(
     cron({
       name: "download-versions",
@@ -462,7 +487,7 @@ const app = new Elysia()
         }
         const release = await buildLock.acquire();
         console.log(
-          `[${new Date().toISOString()}] Cron: start refreshing versions and building missing zips`
+          `[${new Date().toISOString()}] Cron: start refreshing versions and building missing zips`,
         );
         try {
           await getVersionsWithResolvedWindowsZip("https://account.vintagestory.at/");
@@ -473,7 +498,7 @@ const app = new Elysia()
           release();
         }
       },
-    })
+    }),
   )
   .get("/mod/:modid", async ({ params: { modid } }) => {
     const cacheKey = `vsapi:mod:${modid}`;
@@ -481,7 +506,7 @@ const app = new Elysia()
     if (cached) {
       try {
         return JSON.parse(cached);
-      } catch { }
+      } catch {}
     }
     const response = await fetch(`https://mods.vintagestory.at/api/mod/${modid}`);
     if (!response.ok) {
@@ -492,37 +517,44 @@ const app = new Elysia()
     await redis.set(cacheKey, JSON.stringify(mod), "EX", 3600);
     return mod;
   })
-  .get("/mods", async ({ query }) => {
-    // Check in redis if we have cached mod list
-    const cacheKey = `vsapi:mods:${query.versions || "all"}`;
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      try {
-        return JSON.parse(cached);
-      } catch { }
-    }
+  .get(
+    "/mods",
+    async ({ query }) => {
+      // Check in redis if we have cached mod list
+      const cacheKey = `vsapi:mods:${query.versions || "all"}`;
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        try {
+          return JSON.parse(cached);
+        } catch {}
+      }
 
-    let fetchUrl = "https://mods.vintagestory.at/api/mods";
-    if (query.versions) {
-      fetchUrl += `?${query.versions.split(",").map((v) => `gameversions[]=${v}`).join("&")}`;
-    }
+      let fetchUrl = "https://mods.vintagestory.at/api/mods";
+      if (query.versions) {
+        fetchUrl += `?${query.versions
+          .split(",")
+          .map((v) => `gameversions[]=${v}`)
+          .join("&")}`;
+      }
 
-    // Fetch and parse
-    const response = await fetch(fetchUrl);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch mods: ${response.status} ${response.statusText}`);
-    }
-    const mods = await response.json();
+      // Fetch and parse
+      const response = await fetch(fetchUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch mods: ${response.status} ${response.statusText}`);
+      }
+      const mods = await response.json();
 
-    // Cache for 1 hour
-    await redis.set(cacheKey, JSON.stringify(mods), "EX", 3600);
+      // Cache for 1 hour
+      await redis.set(cacheKey, JSON.stringify(mods), "EX", 3600);
 
-    return mods;
-  }, {
-    query: t.Object({
-      versions: t.Optional(t.String()),
-    })
-  })
+      return mods;
+    },
+    {
+      query: t.Object({
+        versions: t.Optional(t.String()),
+      }),
+    },
+  )
   .get("/modtags", async () => {
     // Check in redis if we have cached mod tags
     const cacheKey = "vsapi:modtags";
@@ -530,7 +562,7 @@ const app = new Elysia()
     if (cached) {
       try {
         return JSON.parse(cached);
-      } catch { }
+      } catch {}
     }
 
     // Fetch and parse
@@ -554,88 +586,108 @@ const app = new Elysia()
     const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     return await mergeBuiltZips(versions);
   })
-  .get("/download/:version", async ({ params: { version } }) => {
-    const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
-    const v = versions[version];
-    if (!v) {
-      return { error: "Version not found" };
-    }
-    const merged = await mergeBuiltZips({ [version]: v });
-    return merged[version];
-  }, {
-    params: t.Object({
-      version: t.String()
-    })
-  })
-  .get("/download/:version/:platform", async ({ params: { version, platform } }) => {
-    let versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
-    const v = versions[version];
-    if (!v) {
-      return { error: "Version not found" };
-    }
-    if (platform === "windows") {
-      versions = await mergeBuiltZips({ [version]: v });
-    }
-    if (!(platform in v)) {
-      return { error: "Invalid platform" };
-    }
-    return { url: versions[version][platform] };
-  }, {
-    params: t.Object({
-      version: t.String(),
-      platform: t.Enum({
-        windows: "windows",
-        mac: "mac",
-        linux: "linux",
-        linux_server: "linux_server",
-        windows_server: "windows_server"
-      })
-    })
-  })
-  .get("/query/:address", async ({ request, params: { address }, query, set }) => {
-    // Rate limit
-    const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
-      || request.headers.get("x-real-ip")
-      || "unknown";
-    const rl = await checkRateLimit(ip);
-    set.headers["X-RateLimit-Limit"] = String(QUERY_RATE_LIMIT);
-    set.headers["X-RateLimit-Remaining"] = String(rl.remaining);
-    set.headers["X-RateLimit-Reset"] = String(rl.reset);
-    if (!rl.allowed) {
-      set.status = 429;
-      return { error: "Too many requests", retryAfter: rl.reset };
-    }
+  .get(
+    "/download/:version",
+    async ({ params: { version } }) => {
+      const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
+      const v = versions[version];
+      if (!v) {
+        return { error: "Version not found" };
+      }
+      const merged = await mergeBuiltZips({ [version]: v });
+      return merged[version];
+    },
+    {
+      params: t.Object({
+        version: t.String(),
+      }),
+    },
+  )
+  .get(
+    "/download/:version/:platform",
+    async ({ params: { version, platform } }) => {
+      let versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
+      const v = versions[version];
+      if (!v) {
+        return { error: "Version not found" };
+      }
+      if (platform === "windows") {
+        versions = await mergeBuiltZips({ [version]: v });
+      }
+      if (!(platform in v)) {
+        return { error: "Invalid platform" };
+      }
+      return { url: versions[version][platform] };
+    },
+    {
+      params: t.Object({
+        version: t.String(),
+        platform: t.Enum({
+          windows: "windows",
+          mac: "mac",
+          linux: "linux",
+          linux_server: "linux_server",
+          windows_server: "windows_server",
+        }),
+      }),
+    },
+  )
+  .get(
+    "/query/:address",
+    async ({ request, params: { address }, query, set }) => {
+      // Rate limit
+      const ip =
+        request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+        request.headers.get("x-real-ip") ||
+        "unknown";
+      const rl = await checkRateLimit(ip);
+      set.headers["X-RateLimit-Limit"] = String(QUERY_RATE_LIMIT);
+      set.headers["X-RateLimit-Remaining"] = String(rl.remaining);
+      set.headers["X-RateLimit-Reset"] = String(rl.reset);
+      if (!rl.allowed) {
+        set.status = 429;
+        return { error: "Too many requests", retryAfter: rl.reset };
+      }
 
-    let host = address;
-    let port = 42420;
+      let host = address;
+      let port = 42420;
 
-    // Parse host:port from address
-    if (!host.startsWith("[")) {
-      const parts = host.split(":");
-      if (parts.length > 1) {
-        const maybePort = parseInt(parts[parts.length - 1], 10);
-        if (!isNaN(maybePort) && maybePort > 0 && maybePort <= 65535) {
-          port = maybePort;
-          host = parts.slice(0, -1).join(":");
+      // Parse host:port from address
+      if (!host.startsWith("[")) {
+        const parts = host.split(":");
+        if (parts.length > 1) {
+          const maybePort = parseInt(parts[parts.length - 1], 10);
+          if (!isNaN(maybePort) && maybePort > 0 && maybePort <= 65535) {
+            port = maybePort;
+            host = parts.slice(0, -1).join(":");
+          }
         }
       }
-    }
 
-    const password = query.password || "";
-    const timeout = query.timeout ? parseInt(query.timeout, 10) : 8000;
+      const password = query.password || "";
+      const timeout = query.timeout ? parseInt(query.timeout, 10) : 8000;
 
-    const result = await queryServer(host, port, timeout, password);
-    const passwordResult = await queryServer(host, port, timeout, password, result.serverGameVersion, result.serverNetworkVersion)
-    return { ...result, ...passwordResult };
-  }, {
-    params: t.Object({
-      address: t.String(),
-    }),
-    query: t.Object({
-      password: t.Optional(t.String()),
-      timeout: t.Optional(t.String()),
-    }),
-  })
+      const result = await queryServer(host, port, timeout, password);
+      const passwordResult = await queryServer(
+        host,
+        port,
+        timeout,
+        password,
+        result.serverGameVersion,
+        result.serverNetworkVersion,
+      );
+      return { ...result, ...passwordResult };
+    },
+    {
+      params: t.Object({
+        address: t.String(),
+      }),
+      query: t.Object({
+        password: t.Optional(t.String()),
+        timeout: t.Optional(t.String()),
+      }),
+    },
+  )
   .get("/resolved", async ({ set, store: { cron } }) => {
     if (buildLock.isLocked) {
       set.status = 409;
@@ -649,6 +701,78 @@ const app = new Elysia()
       return { ok: false, message: (e as Error).message };
     }
   })
+  // ─── Modpack modConfig upload ────────────────────────────────────
+  .post(
+    "/api/modpacks/:slug/versions/upload",
+    async ({ request, params: { slug }, set }) => {
+      // Validate session
+      const session = await auth.api.getSession({ headers: request.headers });
+      if (!session) {
+        set.status = 401;
+        return { error: "Unauthorized – session required" };
+      }
+
+      // Find modpack and check ownership
+      const [mp] = await db.select().from(modpack).where(eq(modpack.slug, slug)).limit(1);
+      if (!mp) {
+        set.status = 404;
+        return { error: "Modpack not found" };
+      }
+      if (mp.owner !== session.user.id) {
+        set.status = 401;
+        return { error: "Unauthorized – you must own the modpack" };
+      }
+
+      // Parse multipart form data
+      const contentType = request.headers.get("content-type") ?? "";
+      if (!contentType.includes("multipart/form-data")) {
+        set.status = 400;
+        return { error: "Expected multipart/form-data with modConfig field" };
+      }
+
+      let formData: FormData;
+      try {
+        formData = await request.formData();
+      } catch {
+        set.status = 400;
+        return { error: "Failed to parse form data" };
+      }
+
+      const modConfigFile = formData.get("modConfig");
+      if (!modConfigFile || typeof modConfigFile === "string") {
+        set.status = 400;
+        return { error: "modConfig file is required" };
+      }
+
+      // Build R2 key from optional version field (for pre-linking) or use "latest"
+      const versionField = formData.get("version");
+      const version = typeof versionField === "string" && versionField.trim()
+        ? versionField.trim()
+        : "latest";
+
+      const key = `modpacks/${slug}/${version}/modconfigs.zip`;
+      const buffer = Buffer.from(await modConfigFile.arrayBuffer());
+
+      try {
+        await s3.write(key, buffer, {
+          type: "application/zip",
+          acl: "public-read",
+        });
+      } catch (err) {
+        console.error("R2 upload failed:", err);
+        set.status = 500;
+        return { error: "Failed to upload modConfig to storage" };
+      }
+
+      const url = publicUrlFor(key);
+      return { url, key };
+    },
+    {
+      params: t.Object({
+        slug: t.String(),
+      }),
+    },
+  )
   .listen(3050);
 
 console.log(`Elysia running at ${app.server?.hostname}:${app.server?.port}`);

@@ -4,16 +4,25 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "bun run --watch src/index.ts",
-    "build": "bun build --compile --minify-whitespace --minify-syntax --outfile server src/index.ts"
+    "build": "bun build --compile --minify-whitespace --minify-syntax --outfile server src/index.ts",
+    "auth:generate": "bun x --bun auth@latest generate --output src/db/schema.ts --dialect sqlite --adapter drizzle -y && bun db:generate",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
     "@elysiajs/cors": "^1.4.2",
     "@elysiajs/cron": "^1.4.2",
+    "@libsql/client": "^0.17.3",
+    "better-auth": "^1.6.13",
     "cheerio": "^1.2.0",
+    "drizzle-orm": "^0.45.2",
     "elysia": "1.4.28"
   },
   "devDependencies": {
-    "bun-types": "1.3.14"
+    "bun-types": "1.3.14",
+    "dotenv": "^17.4.2",
+    "drizzle-kit": "0.31.10",
+    "tsx": "^4.22.4"
   },
   "module": "src/index.js"
 }
