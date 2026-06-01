@@ -250,8 +250,9 @@ export const modpacks: BetterAuthPlugin = {
         }
 
         const result = modpacks.map((m) => {
-          const owner = m.owner ? (({ email: _, ...rest }) => rest)(m.owner) : m.owner;
-          return { ...m, owner, downloads: downloadsByModpack[m.id] || 0 };
+          const { user: _, ...modpack } = m;
+          const owner = m.user ? (({ email: __, ...rest }: any) => rest)(m.user) : null;
+          return { ...modpack, owner, downloads: downloadsByModpack[m.id] || 0 };
         });
 
         return ctx.json({ totalCount, modpacks: result });
@@ -324,9 +325,10 @@ export const modpacks: BetterAuthPlugin = {
           where: [{ field: "modpack", value: modpack.id, operator: "eq" }],
         })) as any[];
         const downloads = versions.reduce((sum: number, v: any) => sum + (v.downloads || 0), 0);
-        const owner = modpack.owner ? (({ email: _, ...rest }: any) => rest)(modpack.owner) : modpack.owner;
+        const { user: _, ...modpackClean } = modpack;
+        const owner = modpack.user ? (({ email: __, ...rest }: any) => rest)(modpack.user) : null;
 
-        return ctx.json({ ...modpack, owner, downloads, modpackVersions: versions });
+        return ctx.json({ ...modpackClean, owner, downloads, modpackVersions: versions });
       },
     ),
 
@@ -546,9 +548,10 @@ export const modpacks: BetterAuthPlugin = {
         })) as any[];
         const downloads = versions.reduce((sum: number, v: any) => sum + (v.downloads || 0), 0);
 
-        const owner = modpack.owner ? (({ email: _, ...rest }: any) => rest)(modpack.owner) : modpack.owner;
+        const { user: _, ...modpackClean } = modpack;
+        const owner = modpack.user ? (({ email: __, ...rest }: any) => rest)(modpack.user) : null;
 
-        return ctx.json({ ...modpack, owner, downloads });
+        return ctx.json({ ...modpackClean, owner, downloads });
       },
     ),
 
