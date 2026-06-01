@@ -168,7 +168,15 @@ export const modpacks: BetterAuthPlugin = {
                           name: { type: "string" },
                           description: { type: "string" },
                           imageUrl: { type: "string" },
-                          owner: { type: "string" },
+                          downloads: { type: "number" },
+                          owner: {
+                            type: "object",
+                            properties: {
+                              id: { type: "string" },
+                              name: { type: "string" },
+                              image: { type: "string" },
+                            },
+                          },
                           createdAt: { type: "string" },
                         },
                       },
@@ -215,7 +223,7 @@ export const modpacks: BetterAuthPlugin = {
           model: "modpack",
           where,
         });
-        const modpacks = await ctx.context.adapter.findMany({
+        const modpacks = (await ctx.context.adapter.findMany({
           model: "modpack",
           limit: ctx.query.limit,
           offset: ctx.query.offset,
@@ -224,8 +232,29 @@ export const modpacks: BetterAuthPlugin = {
             direction: ctx.query.order ?? "desc",
           },
           where,
+          join: { user: true },
+        })) as any[];
+
+        // Compute download totals from all versions of returned modpacks
+        let downloadsByModpack: Record<string, number> = {};
+        if (modpacks.length > 0) {
+          const modpackIds = modpacks.map((m) => m.id);
+          const versions = (await ctx.context.adapter.findMany({
+            model: "modpackVersion",
+            where: [{ field: "modpack", value: modpackIds, operator: "in" }],
+          })) as any[];
+          for (const v of versions) {
+            downloadsByModpack[v.modpack] =
+              (downloadsByModpack[v.modpack] || 0) + (v.downloads || 0);
+          }
+        }
+
+        const result = modpacks.map((m) => {
+          const owner = m.owner ? (({ email: _, ...rest }) => rest)(m.owner) : m.owner;
+          return { ...m, owner, downloads: downloadsByModpack[m.id] || 0 };
         });
-        return ctx.json({ totalCount, modpacks });
+
+        return ctx.json({ totalCount, modpacks: result });
       },
     ),
 
@@ -250,7 +279,26 @@ export const modpacks: BetterAuthPlugin = {
                         name: { type: "string" },
                         description: { type: "string" },
                         imageUrl: { type: "string" },
-                        owner: { type: "string" },
+                        downloads: { type: "number" },
+                        owner: {
+                          type: "object",
+                          properties: {
+                            id: { type: "string" },
+                            name: { type: "string" },
+                            image: { type: "string" },
+                          },
+                        },
+                        modpackVersions: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            properties: {
+                              id: { type: "string" },
+                              version: { type: "string" },
+                              downloads: { type: "number" },
+                            },
+                          },
+                        },
                         createdAt: { type: "string", format: "date-time" },
                         updatedAt: { type: "string", format: "date-time" },
                       },
@@ -264,18 +312,21 @@ export const modpacks: BetterAuthPlugin = {
         },
       },
       async (ctx) => {
-        const modpack = await ctx.context.adapter.findOne({
+        const modpack = (await ctx.context.adapter.findOne({
           model: "modpack",
-          where: [
-            {
-              field: "slug",
-              value: ctx.params.slug,
-              operator: "eq",
-            },
-          ],
-        });
+          where: [{ field: "slug", value: ctx.params.slug, operator: "eq" }],
+          join: { user: true },
+        })) as any;
         if (!modpack) return ctx.error("NOT_FOUND");
-        return ctx.json(modpack);
+
+        const versions = (await ctx.context.adapter.findMany({
+          model: "modpackVersion",
+          where: [{ field: "modpack", value: modpack.id, operator: "eq" }],
+        })) as any[];
+        const downloads = versions.reduce((sum: number, v: any) => sum + (v.downloads || 0), 0);
+        const owner = modpack.owner ? (({ email: _, ...rest }: any) => rest)(modpack.owner) : modpack.owner;
+
+        return ctx.json({ ...modpack, owner, downloads, modpackVersions: versions });
       },
     ),
 
@@ -322,7 +373,15 @@ export const modpacks: BetterAuthPlugin = {
                         name: { type: "string" },
                         description: { type: "string" },
                         imageUrl: { type: "string" },
-                        owner: { type: "string" },
+                        downloads: { type: "number" },
+                        owner: {
+                          type: "object",
+                          properties: {
+                            id: { type: "string" },
+                            name: { type: "string" },
+                            image: { type: "string" },
+                          },
+                        },
                         createdAt: { type: "string", format: "date-time" },
                       },
                     },
@@ -336,18 +395,22 @@ export const modpacks: BetterAuthPlugin = {
       },
       async (ctx) => {
         if (!ctx.context.session) return ctx.error("UNAUTHORIZED");
-        return ctx.json(
-          ctx.context.adapter.create({
-            model: "modpack",
-            data: {
-              slug: ctx.body.slug,
-              name: ctx.body.name,
-              description: ctx.body.description ?? "",
-              imageUrl: ctx.body.imageUrl,
-              owner: ctx.context.session.user.id,
-            },
-          }),
-        );
+        const created = (await ctx.context.adapter.create({
+          model: "modpack",
+          data: {
+            slug: ctx.body.slug,
+            name: ctx.body.name,
+            description: ctx.body.description ?? "",
+            imageUrl: ctx.body.imageUrl,
+            owner: ctx.context.session.user.id,
+          },
+        })) as any;
+        const owner = (({ email: _, ...rest }: any) => rest)(ctx.context.session.user);
+        return ctx.json({
+          ...created,
+          owner,
+          downloads: 0,
+        });
       },
     ),
 
@@ -424,8 +487,35 @@ export const modpacks: BetterAuthPlugin = {
               },
             },
             responses: {
-              200: { description: "Modpack updated" },
-              401: { description: "Unauthorized – session required" },
+              200: {
+                description: "Modpack updated",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        id: { type: "string" },
+                        slug: { type: "string" },
+                        name: { type: "string" },
+                        description: { type: "string" },
+                        imageUrl: { type: "string" },
+                        downloads: { type: "number" },
+                        owner: {
+                          type: "object",
+                          properties: {
+                            id: { type: "string" },
+                            name: { type: "string" },
+                            image: { type: "string" },
+                          },
+                        },
+                        createdAt: { type: "string", format: "date-time" },
+                        updatedAt: { type: "string", format: "date-time" },
+                      },
+                    },
+                  },
+                },
+              },
+              401: { description: "Unauthorized – session required or not the owner" },
               404: { description: "Modpack not found" },
             },
           },
@@ -433,25 +523,32 @@ export const modpacks: BetterAuthPlugin = {
       },
       async (ctx) => {
         if (!ctx.context.session) return ctx.error("UNAUTHORIZED");
-        return ctx.json(
-          ctx.context.adapter.update({
-            model: "modpack",
-            where: [
-              {
-                field: "slug",
-                value: ctx.params.slug,
-                operator: "eq",
-                connector: "AND",
-              },
-              {
-                field: "owner",
-                value: ctx.context.session.user.id,
-                operator: "eq",
-              },
-            ],
-            update: ctx.body,
-          }),
-        );
+        await ctx.context.adapter.update({
+          model: "modpack",
+          where: [
+            { field: "slug", value: ctx.params.slug, operator: "eq", connector: "AND" },
+            { field: "owner", value: ctx.context.session.user.id, operator: "eq" },
+          ],
+          update: ctx.body,
+        });
+
+        // Re-fetch with user join and compute downloads
+        const modpack = (await ctx.context.adapter.findOne({
+          model: "modpack",
+          where: [{ field: "slug", value: ctx.body.slug ?? ctx.params.slug, operator: "eq" }],
+          join: { user: true },
+        })) as any;
+        if (!modpack) return ctx.error("NOT_FOUND");
+
+        const versions = (await ctx.context.adapter.findMany({
+          model: "modpackVersion",
+          where: [{ field: "modpack", value: modpack.id, operator: "eq" }],
+        })) as any[];
+        const downloads = versions.reduce((sum: number, v: any) => sum + (v.downloads || 0), 0);
+
+        const owner = modpack.owner ? (({ email: _, ...rest }: any) => rest)(modpack.owner) : modpack.owner;
+
+        return ctx.json({ ...modpack, owner, downloads });
       },
     ),
 
