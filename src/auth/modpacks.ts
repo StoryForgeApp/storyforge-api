@@ -2,8 +2,8 @@ import { createAuthEndpoint, sessionMiddleware } from "better-auth/api";
 import type { BetterAuthPlugin } from "better-auth";
 import { z } from "zod";
 import { db } from "../db";
-import { modpack, modpackVersion } from "../db/schema";
-import { eq, exists, sql } from "drizzle-orm";
+import { modpack, modpackVersion, user } from "../db/schema";
+import { and, eq, exists, inArray, like, or, sql } from "drizzle-orm";
 
 // ─── R2 delete helper (upload is handled by Elysia route) ────────────
 
@@ -149,10 +149,16 @@ export const modpacks: BetterAuthPlugin = {
         query: z.object({
           limit: z.coerce.number().max(100).min(1).optional(),
           offset: z.coerce.number().min(0).optional(),
-          search: z.string().optional(),
+          search: z
+            .string()
+            .transform((s) => `%${s}%`)
+            .optional(),
           sortBy: z.enum(["createdAt", "name", "downloads", "updatedAt"]).optional(),
           order: z.enum(["asc", "desc"]).optional(),
-          owner: z.string().optional(),
+          owner: z
+            .string()
+            .transform((s) => `%${s}%`)
+            .optional(),
         }),
         metadata: {
           openapi: {
@@ -195,7 +201,7 @@ export const modpacks: BetterAuthPlugin = {
         method: "GET",
       },
       async (ctx) => {
-        const { limit = 20, offset = 0 } = ctx.query;
+        const { limit = 20, offset = 0, search = "", owner = "" } = ctx.query;
         const sortBy = ctx.query.sortBy ?? "createdAt";
         const order = ctx.query.order ?? "desc";
 
@@ -208,10 +214,22 @@ export const modpacks: BetterAuthPlugin = {
           )
         `;
 
-        const totalCount = await db.$count(
-          modpack,
+        const where = and(
           exists(db.select().from(modpackVersion).where(eq(modpack.id, modpackVersion.modpack))),
+          or(
+            like(modpack.description, search),
+            like(modpack.slug, search),
+            like(modpack.name, search),
+          ),
+          exists(
+            db
+              .select()
+              .from(user)
+              .where(and(eq(user.id, modpack.owner), like(user.name, owner))),
+          ),
         );
+
+        const totalCount = await db.$count(modpack, where);
 
         const allModpacks = await db.query.modpack.findMany({
           orderBy: (table, { desc, asc }) => {
@@ -225,8 +243,7 @@ export const modpacks: BetterAuthPlugin = {
                     : downloadsSubquery;
             return [order === "desc" ? desc(column) : asc(column)];
           },
-          where: (table) =>
-            exists(db.select().from(modpackVersion).where(eq(table.id, modpackVersion.modpack))),
+          where,
           limit,
           offset,
           with: {
