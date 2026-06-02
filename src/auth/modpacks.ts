@@ -216,11 +216,13 @@ export const modpacks: BetterAuthPlugin = {
 
         const where = and(
           exists(db.select().from(modpackVersion).where(eq(modpack.id, modpackVersion.modpack))),
-          or(
-            like(modpack.description, search),
-            like(modpack.slug, search),
-            like(modpack.name, search),
-          ),
+          search
+            ? or(
+                like(modpack.description, search),
+                like(modpack.slug, search),
+                like(modpack.name, search),
+              )
+            : undefined,
           owner
             ? exists(
                 db
