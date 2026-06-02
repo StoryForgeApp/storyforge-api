@@ -2,7 +2,6 @@ import { createAuthEndpoint, sessionMiddleware } from "better-auth/api";
 import type { BetterAuthPlugin } from "better-auth";
 import { z } from "zod";
 import { db } from "../db";
-import { modpackVersion as modpackVersionTable } from "../db/schema";
 
 // ─── R2 delete helper (upload is handled by Elysia route) ────────────
 
@@ -222,16 +221,14 @@ export const modpacks: BetterAuthPlugin = {
             user: true,
             modpackVersions: true,
           },
-          extras: (table, { sql }) => ({
-            downloads:
-              sql<number>`SELECT COALESCE(SUM(downloads), 0) FROM ${modpackVersionTable} WHERE ${modpackVersionTable.modpack} = ${table.id}`.as(
-                "downloads",
-              ),
-          }),
         });
 
         let result = allModpacks.map((m) => ({
           ...m,
+          downloads: (m.modpackVersions || []).reduce(
+            (sum: number, v: any) => sum + (v.downloads || 0),
+            0,
+          ),
           owner: m.user ? { id: m.user.id, name: m.user.name, image: m.user.image } : null,
           user: undefined,
         }));
