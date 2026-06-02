@@ -221,12 +221,14 @@ export const modpacks: BetterAuthPlugin = {
             like(modpack.slug, search),
             like(modpack.name, search),
           ),
-          exists(
-            db
-              .select()
-              .from(user)
-              .where(and(eq(user.id, modpack.owner), like(user.name, owner))),
-          ),
+          owner
+            ? exists(
+                db
+                  .select()
+                  .from(user)
+                  .where(and(eq(user.id, modpack.owner), like(user.name, owner))),
+              )
+            : undefined,
         );
 
         const totalCount = await db.$count(modpack, where);
