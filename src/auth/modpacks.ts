@@ -233,6 +233,13 @@ export const modpacks: BetterAuthPlugin = {
 
         const allModpacks = await db.query.modpack.findMany({
           orderBy: (table, { desc, asc }) => {
+            // Use the column alias when sorting by downloads
+            if (sortBy === "downloads") {
+              const downloadsColumn = sql.identifier("downloads"); // safe identifier
+              return [order === "desc" ? desc(downloadsColumn) : asc(downloadsColumn)];
+            }
+
+            // Other columns work normally
             const column =
               sortBy === "createdAt"
                 ? table.createdAt
@@ -240,7 +247,8 @@ export const modpacks: BetterAuthPlugin = {
                   ? table.name
                   : sortBy === "updatedAt"
                     ? table.updatedAt
-                    : downloadsSubquery;
+                    : /* fallback */ table.createdAt; // or whatever default
+
             return [order === "desc" ? desc(column) : asc(column)];
           },
           where,
