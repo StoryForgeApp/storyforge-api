@@ -368,7 +368,13 @@ export const modpacks: BetterAuthPlugin = {
           slug: z.string(),
           name: z.string(),
           description: z.string().optional(),
-          imageUrl: z.string().optional(),
+          imageUrl: z
+            .url()
+            .refine(
+              (url) =>
+                url.startsWith("https://") && new URL(url).hostname === "moddbcdn.vintagestory.at",
+            )
+            .optional(),
         }),
         use: [sessionMiddleware],
         metadata: {
@@ -610,10 +616,9 @@ export const modpacks: BetterAuthPlugin = {
         }),
         metadata: {
           openapi: {
-            description: "Checks whether a modpack slug is available. If taken, returns up to 5 alternatives.",
-            parameters: [
-              { name: "slug", in: "query", required: true, schema: { type: "string" } },
-            ],
+            description:
+              "Checks whether a modpack slug is available. If taken, returns up to 5 alternatives.",
+            parameters: [{ name: "slug", in: "query", required: true, schema: { type: "string" } }],
             responses: {
               200: {
                 description: "Slug availability result",
