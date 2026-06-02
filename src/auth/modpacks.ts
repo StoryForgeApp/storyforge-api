@@ -1,6 +1,8 @@
 import { createAuthEndpoint, sessionMiddleware } from "better-auth/api";
-import type { BetterAuthPlugin, Where } from "better-auth";
+import type { BetterAuthPlugin } from "better-auth";
 import { z } from "zod";
+import { db } from "../db";
+import { modpackVersion as modpackVersionTable } from "../db/schema";
 
 // ─── R2 delete helper (upload is handled by Elysia route) ────────────
 
@@ -144,10 +146,10 @@ export const modpacks: BetterAuthPlugin = {
       "/modpacks",
       {
         query: z.object({
-          limit: z.coerce.number().optional(),
-          offset: z.coerce.number().optional(),
+          limit: z.coerce.number().max(100).min(1).optional(),
+          offset: z.coerce.number().min(0).optional(),
           search: z.string().optional(),
-          sortBy: z.string().optional(),
+          sortBy: z.enum(["createdAt", "name", "downloads", "updatedAt"]).optional(),
           order: z.enum(["asc", "desc"]).optional(),
           owner: z.string().optional(),
         }),
@@ -192,68 +194,54 @@ export const modpacks: BetterAuthPlugin = {
         method: "GET",
       },
       async (ctx) => {
-        const where: Where[] = [];
-        if (ctx.query.search) {
-          where.push(
-            {
-              field: "name",
-              value: ctx.query.search,
-              operator: "contains",
-              connector: "OR",
-              mode: "insensitive",
-            },
-            {
-              field: "slug",
-              value: ctx.query.search,
-              operator: "contains",
-              connector: "OR",
-              mode: "insensitive",
-            },
-          );
-        }
-        if (ctx.query.owner) {
-          where.push({
-            field: "owner",
-            value: ctx.query.owner,
-            operator: "eq",
-            connector: "AND",
-          });
-        }
-        const totalCount = await ctx.context.adapter.count({
-          model: "modpack",
-          where,
-        });
-        const modpacks = (await ctx.context.adapter.findMany({
-          model: "modpack",
-          limit: ctx.query.limit,
-          offset: ctx.query.offset,
-          sortBy: {
-            field: ctx.query.sortBy ?? "createdAt",
-            direction: ctx.query.order ?? "desc",
+        const { limit = 20, offset = 0 } = ctx.query;
+        const sortBy = ctx.query.sortBy ?? "createdAt";
+        const order = ctx.query.order ?? "desc";
+
+        const totalCount = await ctx.context.adapter.count({ model: "modpack" });
+
+        const allModpacks = await db.query.modpack.findMany({
+          orderBy:
+            sortBy === "downloads"
+              ? (table, { desc, asc }) => [
+                  order === "desc" ? desc(table.createdAt) : asc(table.createdAt),
+                ]
+              : sortBy === "name"
+                ? (table, { desc, asc }) => [order === "desc" ? desc(table.name) : asc(table.name)]
+                : sortBy === "updatedAt"
+                  ? (table, { desc, asc }) => [
+                      order === "desc" ? desc(table.updatedAt) : asc(table.updatedAt),
+                    ]
+                  : (table, { desc, asc }) => [
+                      order === "desc" ? desc(table.createdAt) : asc(table.createdAt),
+                    ],
+          // Drizzle relational API does its own pagination; for downloads sort
+          // we fetch all and sort in memory below.
+          ...(sortBy === "downloads" ? {} : { limit, offset }),
+          with: {
+            user: true,
+            modpackVersions: true,
           },
-          where,
-          join: { user: true },
-        })) as any[];
-
-        // Compute download totals from all versions of returned modpacks
-        let downloadsByModpack: Record<string, number> = {};
-        if (modpacks.length > 0) {
-          const modpackIds = modpacks.map((m) => m.id);
-          const versions = (await ctx.context.adapter.findMany({
-            model: "modpackVersion",
-            where: [{ field: "modpack", value: modpackIds, operator: "in" }],
-          })) as any[];
-          for (const v of versions) {
-            downloadsByModpack[v.modpack] =
-              (downloadsByModpack[v.modpack] || 0) + (v.downloads || 0);
-          }
-        }
-
-        const result = modpacks.map((m) => {
-          const { user: _, ...modpack } = m;
-          const owner = m.user ? { id: m.user.id, name: m.user.name, image: m.user.image } : null;
-          return { ...modpack, owner, downloads: downloadsByModpack[m.id] || 0 };
+          extras: (table, { sql }) => ({
+            downloads:
+              sql<number>`SELECT COALESCE(SUM(downloads), 0) FROM ${modpackVersionTable} WHERE ${modpackVersionTable.modpack} = ${table.id}`.as(
+                "downloads",
+              ),
+          }),
         });
+
+        let result = allModpacks.map((m) => ({
+          ...m,
+          owner: m.user ? { id: m.user.id, name: m.user.name, image: m.user.image } : null,
+          user: undefined,
+        }));
+
+        if (sortBy === "downloads") {
+          result.sort((a, b) =>
+            order === "desc" ? b.downloads - a.downloads : a.downloads - b.downloads,
+          );
+          if (limit != null) result = result.slice(offset ?? 0, (offset ?? 0) + limit);
+        }
 
         return ctx.json({ totalCount, modpacks: result });
       },
@@ -326,7 +314,9 @@ export const modpacks: BetterAuthPlugin = {
         })) as any[];
         const downloads = versions.reduce((sum: number, v: any) => sum + (v.downloads || 0), 0);
         const { user: _, ...modpackClean } = modpack;
-        const owner = modpack.user ? { id: modpack.user.id, name: modpack.user.name, image: modpack.user.image } : null;
+        const owner = modpack.user
+          ? { id: modpack.user.id, name: modpack.user.name, image: modpack.user.image }
+          : null;
 
         return ctx.json({ ...modpackClean, owner, downloads, modpackVersions: versions });
       },
@@ -407,7 +397,11 @@ export const modpacks: BetterAuthPlugin = {
             owner: ctx.context.session.user.id,
           },
         })) as any;
-        const owner = { id: ctx.context.session.user.id, name: ctx.context.session.user.name, image: ctx.context.session.user.image };
+        const owner = {
+          id: ctx.context.session.user.id,
+          name: ctx.context.session.user.name,
+          image: ctx.context.session.user.image,
+        };
         return ctx.json({
           ...created,
           owner,
@@ -549,7 +543,9 @@ export const modpacks: BetterAuthPlugin = {
         const downloads = versions.reduce((sum: number, v: any) => sum + (v.downloads || 0), 0);
 
         const { user: _, ...modpackClean } = modpack;
-        const owner = modpack.user ? { id: modpack.user.id, name: modpack.user.name, image: modpack.user.image } : null;
+        const owner = modpack.user
+          ? { id: modpack.user.id, name: modpack.user.name, image: modpack.user.image }
+          : null;
 
         return ctx.json({ ...modpackClean, owner, downloads });
       },
@@ -707,7 +703,8 @@ export const modpacks: BetterAuthPlugin = {
         method: "POST",
         metadata: {
           openapi: {
-            description: "Increments the download count for a modpack version by 1. Returns the updated version.",
+            description:
+              "Increments the download count for a modpack version by 1. Returns the updated version.",
             parameters: [
               { name: "slug", in: "path", required: true, schema: { type: "string" } },
               { name: "version", in: "path", required: true, schema: { type: "string" } },
