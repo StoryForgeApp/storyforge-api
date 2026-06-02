@@ -3,7 +3,7 @@ import type { BetterAuthPlugin } from "better-auth";
 import { z } from "zod";
 import { db } from "../db";
 import { modpack, modpackVersion, user } from "../db/schema";
-import { and, eq, exists, inArray, like, or, sql } from "drizzle-orm";
+import { and, eq, exists, like, or, sql } from "drizzle-orm";
 
 // ─── R2 delete helper (upload is handled by Elysia route) ────────────
 
@@ -411,12 +411,22 @@ export const modpacks: BetterAuthPlugin = {
                 },
               },
               401: { description: "Unauthorized – session required" },
+              409: { description: "Conflict – slug already exists" },
             },
           },
         },
       },
       async (ctx) => {
         if (!ctx.context.session) return ctx.error("UNAUTHORIZED");
+
+        // Check for duplicate slug
+        const existing = await ctx.context.adapter.findOne({
+          model: "modpack",
+          where: [{ field: "slug", value: ctx.body.slug, operator: "eq" }],
+        });
+        if (existing)
+          return ctx.error("CONFLICT", { message: "A modpack with this slug already exists" });
+
         const created = (await ctx.context.adapter.create({
           model: "modpack",
           data: {
@@ -488,7 +498,6 @@ export const modpacks: BetterAuthPlugin = {
         body: z.object({
           name: z.string().optional(),
           description: z.string().optional(),
-          slug: z.string().optional(),
           imageUrl: z.string().optional(),
         }),
         use: [sessionMiddleware],
@@ -505,7 +514,6 @@ export const modpacks: BetterAuthPlugin = {
                     properties: {
                       name: { type: "string" },
                       description: { type: "string" },
-                      slug: { type: "string" },
                       imageUrl: { type: "string" },
                     },
                   },
@@ -543,12 +551,14 @@ export const modpacks: BetterAuthPlugin = {
               },
               401: { description: "Unauthorized – session required or not the owner" },
               404: { description: "Modpack not found" },
+              409: { description: "Conflict – slug already exists" },
             },
           },
         },
       },
       async (ctx) => {
         if (!ctx.context.session) return ctx.error("UNAUTHORIZED");
+
         await ctx.context.adapter.update({
           model: "modpack",
           where: [
@@ -561,7 +571,7 @@ export const modpacks: BetterAuthPlugin = {
         // Re-fetch with user join and compute downloads
         const modpack = (await ctx.context.adapter.findOne({
           model: "modpack",
-          where: [{ field: "slug", value: ctx.body.slug ?? ctx.params.slug, operator: "eq" }],
+          where: [{ field: "slug", value: ctx.params.slug, operator: "eq" }],
           join: { user: true },
         })) as any;
         if (!modpack) return ctx.error("NOT_FOUND");
@@ -578,6 +588,73 @@ export const modpacks: BetterAuthPlugin = {
           : null;
 
         return ctx.json({ ...modpackClean, owner, downloads });
+      },
+    ),
+
+    // ── Slug availability ────────────────────────────────────────
+
+    checkSlug: createAuthEndpoint(
+      "/modpacks/slug-availability",
+      {
+        method: "GET",
+        query: z.object({
+          slug: z.string(),
+        }),
+        metadata: {
+          openapi: {
+            description: "Checks whether a modpack slug is available. If taken, returns up to 5 alternatives.",
+            parameters: [
+              { name: "slug", in: "query", required: true, schema: { type: "string" } },
+            ],
+            responses: {
+              200: {
+                description: "Slug availability result",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        available: { type: "boolean" },
+                        suggestion: { type: "string" },
+                        alternatives: {
+                          type: "array",
+                          items: { type: "string" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      async (ctx) => {
+        const slug = ctx.query.slug.trim();
+
+        // Check exact match
+        const exact = await ctx.context.adapter.findOne({
+          model: "modpack",
+          where: [{ field: "slug", value: slug, operator: "eq" }],
+        });
+        if (!exact) return ctx.json({ available: true });
+
+        // Slug is taken — find alternatives by appending number suffixes
+        const alternatives: string[] = [];
+        for (let i = 1; alternatives.length < 5 && i < 100; i++) {
+          const candidate = `${slug}-${i}`;
+          const exists = await ctx.context.adapter.findOne({
+            model: "modpack",
+            where: [{ field: "slug", value: candidate, operator: "eq" }],
+          });
+          if (!exists) alternatives.push(candidate);
+        }
+
+        return ctx.json({
+          available: false,
+          suggestion: alternatives[0] ?? null,
+          alternatives,
+        });
       },
     ),
 
