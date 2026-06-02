@@ -2,6 +2,8 @@ import { createAuthEndpoint, sessionMiddleware } from "better-auth/api";
 import type { BetterAuthPlugin } from "better-auth";
 import { z } from "zod";
 import { db } from "../db";
+import { modpack, modpackVersion } from "../db/schema";
+import { eq, exists, sql } from "drizzle-orm";
 
 // ─── R2 delete helper (upload is handled by Elysia route) ────────────
 
@@ -197,48 +199,50 @@ export const modpacks: BetterAuthPlugin = {
         const sortBy = ctx.query.sortBy ?? "createdAt";
         const order = ctx.query.order ?? "desc";
 
-        const totalCount = await ctx.context.adapter.count({ model: "modpack" });
+        const downloadsSubquery = sql<number>`
+          COALESCE(
+            (SELECT SUM(${modpackVersion.downloads})
+             FROM ${modpackVersion}
+             WHERE ${modpackVersion.modpack} = "modpack"."id"
+            ), 0
+          )
+        `;
+
+        const totalCount = await db.$count(
+          modpack,
+          exists(db.select().from(modpackVersion).where(eq(modpack.id, modpackVersion.modpack))),
+        );
 
         const allModpacks = await db.query.modpack.findMany({
-          orderBy:
-            sortBy === "downloads"
-              ? (table, { desc, asc }) => [
-                  order === "desc" ? desc(table.createdAt) : asc(table.createdAt),
-                ]
-              : sortBy === "name"
-                ? (table, { desc, asc }) => [order === "desc" ? desc(table.name) : asc(table.name)]
-                : sortBy === "updatedAt"
-                  ? (table, { desc, asc }) => [
-                      order === "desc" ? desc(table.updatedAt) : asc(table.updatedAt),
-                    ]
-                  : (table, { desc, asc }) => [
-                      order === "desc" ? desc(table.createdAt) : asc(table.createdAt),
-                    ],
-          // Drizzle relational API does its own pagination; for downloads sort
-          // we fetch all and sort in memory below.
-          ...(sortBy === "downloads" ? {} : { limit, offset }),
+          orderBy: (table, { desc, asc }) => {
+            const column =
+              sortBy === "createdAt"
+                ? table.createdAt
+                : sortBy === "name"
+                  ? table.name
+                  : sortBy === "updatedAt"
+                    ? table.updatedAt
+                    : downloadsSubquery;
+            return [order === "desc" ? desc(column) : asc(column)];
+          },
+          where: (table) =>
+            exists(db.select().from(modpackVersion).where(eq(table.id, modpackVersion.modpack))),
+          limit,
+          offset,
           with: {
             user: true,
             modpackVersions: true,
+          },
+          extras: {
+            downloads: downloadsSubquery.as("downloads"),
           },
         });
 
         let result = allModpacks.map((m) => ({
           ...m,
-          downloads: (m.modpackVersions || []).reduce(
-            (sum: number, v: any) => sum + (v.downloads || 0),
-            0,
-          ),
           owner: m.user ? { id: m.user.id, name: m.user.name, image: m.user.image } : null,
           user: undefined,
         }));
-
-        if (sortBy === "downloads") {
-          result.sort((a, b) =>
-            order === "desc" ? b.downloads - a.downloads : a.downloads - b.downloads,
-          );
-          if (limit != null) result = result.slice(offset ?? 0, (offset ?? 0) + limit);
-        }
 
         return ctx.json({ totalCount, modpacks: result });
       },
