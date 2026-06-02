@@ -199,11 +199,15 @@ export const modpacks: BetterAuthPlugin = {
           },
         },
         method: "GET",
+        use: [sessionMiddleware],
       },
       async (ctx) => {
         const { limit = 20, offset = 0, search = "", owner = "" } = ctx.query;
         const sortBy = ctx.query.sortBy ?? "createdAt";
         const order = ctx.query.order ?? "desc";
+
+        // Current session user (may be null for unauthenticated requests)
+        const sessionUserId = ctx.context.session?.user?.id ?? null;
 
         const downloadsSubquery = sql<number>`
           COALESCE(
@@ -215,7 +219,11 @@ export const modpacks: BetterAuthPlugin = {
         `;
 
         const where = and(
-          exists(db.select().from(modpackVersion).where(eq(modpack.id, modpackVersion.modpack))),
+          // Always require versions — except for the current user's own modpacks
+          or(
+            exists(db.select().from(modpackVersion).where(eq(modpack.id, modpackVersion.modpack))),
+            sessionUserId ? eq(modpack.owner, sessionUserId) : undefined,
+          ),
           search
             ? or(
                 like(modpack.description, search),
