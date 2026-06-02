@@ -64,6 +64,7 @@ const builtCache = new Map<string, string>(); // version -> public URL
 type DownloadLinks = {
   windows: string | null;
   mac: string | null;
+  mac_arm64: string | null;
   linux: string | null;
   linux_server: string | null;
   windows_server: string | null;
@@ -78,6 +79,7 @@ type DownloadLinks = {
  *   "<version>": {
  *     windows: "<link>" | null,
  *     mac: "<link>" | null,
+ *     mac_arm64: "<link>" | null,
  *     linux: "<link>" | null,
  *     linux_server: "<link>" | null,
  *     windows_server: "<link>" | null
@@ -149,6 +151,7 @@ export function parseDownloadsFromHtml(html: string) {
       versions[version] = {
         windows: null,
         mac: null,
+        mac_arm64: null,
         linux: null,
         linux_server: null,
         windows_server: null,
@@ -237,8 +240,13 @@ function classifySlotFromHref(href: string): keyof DownloadLinks | null {
   // If you want to include updates, you could add an extra field here.
 
   // Mac
-  if (/osx/.test(h) || /mac/.test(h)) {
+  if (/osx-x64/.test(h) || /mac-x64/.test(h)) {
     return "mac";
+  }
+
+  // Mac (Silicon)
+  if (/osx-arm64/.test(h) || /mac-arm64/.test(h)) {
+    return "mac_arm64";
   }
 
   // Linux client
@@ -746,9 +754,8 @@ const app = new Elysia()
 
       // Build R2 key from optional version field (for pre-linking) or use "latest"
       const versionField = formData.get("version");
-      const version = typeof versionField === "string" && versionField.trim()
-        ? versionField.trim()
-        : "latest";
+      const version =
+        typeof versionField === "string" && versionField.trim() ? versionField.trim() : "latest";
 
       const key = `modpacks/${slug}/${version}/modconfigs.zip`;
       const buffer = Buffer.from(await modConfigFile.arrayBuffer());
