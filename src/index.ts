@@ -698,7 +698,13 @@ const app = new Elysia()
       }),
     },
   )
-  .get("/resolved", async ({ set, store: { cron } }) => {
+  .get("/resolved", async ({ request, set, store: { cron } }) => {
+    // Validate session
+    const session = await auth.api.getSession({ headers: request.headers });
+    if (!session || session.user.role !== "admin") {
+      set.status = 401;
+      return { error: "Unauthorized – session required" };
+    }
     if (buildLock.isLocked) {
       set.status = 409;
       return { ok: false, message: "Build is already running" };
@@ -779,6 +785,27 @@ const app = new Elysia()
     {
       params: t.Object({
         slug: t.String(),
+      }),
+    },
+  )
+  // ─── Admin: Redis key management ──────────────────────────────────
+  .get(
+    "/admin/redis",
+    async ({ request, query, set }) => {
+      const session = await auth.api.getSession({ headers: request.headers });
+      if (!session || session.user.role !== "admin") {
+        set.status = 401;
+        return { error: "Unauthorized – admin required" };
+      }
+
+      const existed = await redis.exists(query.key);
+      await redis.del(query.key);
+
+      return { ok: true, key: query.key, existed: existed };
+    },
+    {
+      query: t.Object({
+        key: t.String(),
       }),
     },
   )
