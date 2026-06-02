@@ -481,6 +481,56 @@ async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
 }
 
 // -------------- routes --------------
+
+// ─── Zip bomb detection ─────────────────────────────────────────────
+
+interface ZipInfo {
+  entries: number;
+  uncompressedSize: number;
+  compressedSize: number;
+}
+
+/** Parses the zip central directory to extract total uncompressed/compressed
+ *  sizes and entry count without decompressing. Returns null if not a valid zip. */
+function inspectZip(buf: Buffer): ZipInfo | null {
+  if (buf.length < 22) return null;
+
+  // Search backwards from end for EOCD signature 0x06054b50
+  const EOCD_SIG = 0x06054b50;
+  const maxSearch = Math.min(buf.length, 65557); // max comment + EOCD
+  let eocdOffset = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - maxSearch); i--) {
+    if (buf.readUInt32LE(i) === EOCD_SIG) {
+      eocdOffset = i;
+      break;
+    }
+  }
+  if (eocdOffset === -1) return null;
+
+  const totalEntries = buf.readUInt16LE(eocdOffset + 8);
+  const cdOffset = buf.readUInt32LE(eocdOffset + 16);
+
+  if (cdOffset >= buf.length || totalEntries === 0) return null;
+
+  let uncompressed = 0;
+  let compressed = 0;
+  let offset = cdOffset;
+
+  for (let i = 0; i < totalEntries && offset + 46 <= buf.length; i++) {
+    const sig = buf.readUInt32LE(offset);
+    if (sig !== 0x02014b50) break; // not a central directory header
+
+    uncompressed += buf.readUInt32LE(offset + 24);
+    compressed += buf.readUInt32LE(offset + 20);
+
+    const nameLen = buf.readUInt16LE(offset + 28);
+    const extraLen = buf.readUInt16LE(offset + 30);
+    const commentLen = buf.readUInt16LE(offset + 32);
+    offset += 46 + nameLen + extraLen + commentLen;
+  }
+
+  return { entries: totalEntries, uncompressedSize: uncompressed, compressedSize: compressed };
+}
 const app = new Elysia()
   // Enable CORS for all routes
   .use(cors())
@@ -760,13 +810,47 @@ const app = new Elysia()
         return { error: "modConfig file is required" };
       }
 
+      // ── Size limits ──────────────────────────────────────────
+      const MAX_UPLOAD_SIZE = 5 * 1024 * 1024; // 5 MB
+      if (modConfigFile.size > MAX_UPLOAD_SIZE) {
+        set.status = 400;
+        return { error: `File too large — max ${MAX_UPLOAD_SIZE / 1024 / 1024}MB` };
+      }
+
+      const buffer = Buffer.from(await modConfigFile.arrayBuffer());
+
+      // ── Zip bomb detection ────────────────────────────────────
+      const zipInfo = inspectZip(buffer);
+      if (zipInfo) {
+        const MAX_UNCOMPRESSED = 10 * 1024 * 1024; // 10 MB
+        const MAX_ENTRIES = 10_000;
+        const MAX_RATIO = 100; // compressed * ratio < uncompressed → suspicious
+
+        if (zipInfo.uncompressedSize > MAX_UNCOMPRESSED) {
+          set.status = 400;
+          return {
+            error: `Zip expands to ${(zipInfo.uncompressedSize / 1024 / 1024).toFixed(0)}MB, max ${MAX_UNCOMPRESSED / 1024 / 1024}MB`,
+          };
+        }
+        if (zipInfo.entries > MAX_ENTRIES) {
+          set.status = 400;
+          return { error: `Zip contains ${zipInfo.entries} entries, max ${MAX_ENTRIES}` };
+        }
+        if (
+          zipInfo.compressedSize > 1024 &&
+          zipInfo.uncompressedSize > zipInfo.compressedSize * MAX_RATIO
+        ) {
+          set.status = 400;
+          return { error: "Suspicious compression ratio — possible zip bomb" };
+        }
+      }
+
       // Build R2 key from optional version field (for pre-linking) or use "latest"
       const versionField = formData.get("version");
       const version =
         typeof versionField === "string" && versionField.trim() ? versionField.trim() : "latest";
 
       const key = `modpacks/${slug}/${version}/modconfigs.zip`;
-      const buffer = Buffer.from(await modConfigFile.arrayBuffer());
 
       try {
         await s3.write(key, buffer, {
