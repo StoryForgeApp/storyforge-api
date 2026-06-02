@@ -199,6 +199,7 @@ export function parseDownloadsFromHtml(html: string) {
     const entry = versions[v];
     entry.windows = entry.windows || null;
     entry.mac = entry.mac || null;
+    entry.mac_arm64 = entry.mac_arm64 || null;
     entry.linux = entry.linux || null;
     entry.linux_server = entry.linux_server || null;
     entry.windows_server = entry.windows_server || null;
@@ -633,6 +634,7 @@ const app = new Elysia()
         platform: t.Enum({
           windows: "windows",
           mac: "mac",
+          mac_arm64: "mac_arm64",
           linux: "linux",
           linux_server: "linux_server",
           windows_server: "windows_server",
