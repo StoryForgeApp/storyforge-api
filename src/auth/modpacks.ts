@@ -512,7 +512,13 @@ export const modpacks: BetterAuthPlugin = {
         body: z.object({
           name: z.string().optional(),
           description: z.string().optional(),
-          imageUrl: z.string().optional(),
+          imageUrl: z
+            .url()
+            .refine(
+              (url) =>
+                url.startsWith("https://") && new URL(url).hostname === "moddbcdn.vintagestory.at",
+            )
+            .optional(),
         }),
         use: [sessionMiddleware],
         metadata: {
