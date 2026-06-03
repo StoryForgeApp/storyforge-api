@@ -1,4 +1,4 @@
-import { createAuthEndpoint, sessionMiddleware } from "better-auth/api";
+import { createAuthEndpoint, getSessionFromCtx, sessionMiddleware } from "better-auth/api";
 import type { BetterAuthPlugin } from "better-auth";
 import { z } from "zod";
 import { db } from "../db";
@@ -199,15 +199,17 @@ export const modpacks: BetterAuthPlugin = {
           },
         },
         method: "GET",
-        use: [sessionMiddleware],
+        use: [],
       },
       async (ctx) => {
         const { limit = 20, offset = 0, search = "", owner = "" } = ctx.query;
         const sortBy = ctx.query.sortBy ?? "createdAt";
         const order = ctx.query.order ?? "desc";
 
+        const session = await getSessionFromCtx(ctx);
+
         // Current session user (may be null for unauthenticated requests)
-        const sessionUserId = ctx.context.session?.user?.id ?? null;
+        const sessionUserId = session?.user?.id ?? null;
 
         const downloadsSubquery = sql<number>`
           COALESCE(
