@@ -146,20 +146,6 @@ export const modpacks: BetterAuthPlugin = {
     getModpacks: createAuthEndpoint(
       "/modpacks",
       {
-        query: z.object({
-          limit: z.coerce.number().max(100).min(1).optional(),
-          offset: z.coerce.number().min(0).optional(),
-          search: z
-            .string()
-            .transform((s) => `%${s}%`)
-            .optional(),
-          sortBy: z.enum(["createdAt", "name", "downloads", "updatedAt"]).optional(),
-          order: z.enum(["asc", "desc"]).optional(),
-          owner: z
-            .string()
-            .transform((s) => `%${s}%`)
-            .optional(),
-        }),
         metadata: {
           openapi: {
             description: "Returns the list of available modpacks",
@@ -199,13 +185,8 @@ export const modpacks: BetterAuthPlugin = {
           },
         },
         method: "GET",
-        use: [],
       },
       async (ctx) => {
-        const { limit = 20, offset = 0, search = "", owner = "" } = ctx.query;
-        const sortBy = ctx.query.sortBy ?? "createdAt";
-        const order = ctx.query.order ?? "desc";
-
         const session = await getSessionFromCtx(ctx);
 
         // Current session user (may be null for unauthenticated requests)
@@ -220,54 +201,18 @@ export const modpacks: BetterAuthPlugin = {
           )
         `;
 
-        const where = and(
+        const where =
           // Always require versions — except for the current user's own modpacks
           or(
             exists(db.select().from(modpackVersion).where(eq(modpack.id, modpackVersion.modpack))),
             sessionUserId ? eq(modpack.owner, sessionUserId) : undefined,
-          ),
-          search
-            ? or(
-                like(modpack.description, search),
-                like(modpack.slug, search),
-                like(modpack.name, search),
-              )
-            : undefined,
-          owner
-            ? exists(
-                db
-                  .select()
-                  .from(user)
-                  .where(and(eq(user.id, modpack.owner), like(user.name, owner))),
-              )
-            : undefined,
-        );
+          );
 
         const totalCount = await db.$count(modpack, where);
 
         const allModpacks = await db.query.modpack.findMany({
-          orderBy: (table, { desc, asc }) => {
-            // Use the column alias when sorting by downloads
-            if (sortBy === "downloads") {
-              const downloadsColumn = sql.identifier("downloads"); // safe identifier
-              return [order === "desc" ? desc(downloadsColumn) : asc(downloadsColumn)];
-            }
-
-            // Other columns work normally
-            const column =
-              sortBy === "createdAt"
-                ? table.createdAt
-                : sortBy === "name"
-                  ? table.name
-                  : sortBy === "updatedAt"
-                    ? table.updatedAt
-                    : /* fallback */ table.createdAt; // or whatever default
-
-            return [order === "desc" ? desc(column) : asc(column)];
-          },
+          orderBy: (table, { desc }) => desc(table.updatedAt),
           where,
-          limit,
-          offset,
           with: {
             user: true,
             modpackVersions: true,
