@@ -2,8 +2,8 @@ import { createAuthEndpoint, getSessionFromCtx, sessionMiddleware } from "better
 import type { BetterAuthPlugin } from "better-auth";
 import { z } from "zod";
 import { db } from "../db";
-import { modpack, modpackVersion, user } from "../db/schema";
-import { and, eq, exists, like, or, sql } from "drizzle-orm";
+import { modpack, modpackVersion } from "../db/schema";
+import { eq, exists, or, sql } from "drizzle-orm";
 
 // ─── R2 delete helper (upload is handled by Elysia route) ────────────
 
@@ -27,6 +27,13 @@ async function r2DeleteModConfig(slug: string, version: string): Promise<void> {
   const key = modpackConfigKey(slug, version);
   await s3.delete(key);
 }
+
+const SemVer = z
+  .string()
+  .regex(
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/,
+    "Invalid semantic version",
+  );
 
 // ─── Plugin ─────────────────────────────────────────────────────────
 
@@ -841,8 +848,8 @@ export const modpacks: BetterAuthPlugin = {
         method: "POST",
         use: [sessionMiddleware],
         body: z.object({
-          version: z.string(),
-          gameVersion: z.string().optional(),
+          version: SemVer,
+          gameVersion: SemVer,
           modsString: z.string().optional(),
           modConfigsUrl: z.string().optional(),
           imageUrl: z.string().optional(),
@@ -943,8 +950,8 @@ export const modpacks: BetterAuthPlugin = {
         method: "PUT",
         use: [sessionMiddleware],
         body: z.object({
-          version: z.string().optional(),
-          gameVersion: z.string().optional(),
+          version: SemVer.optional(),
+          gameVersion: SemVer.optional(),
           modsString: z.string().optional(),
           modConfigsUrl: z.string().optional(),
           imageUrl: z.string().optional(),
