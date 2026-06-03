@@ -23,7 +23,13 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
   },
-  trustedOrigins: ["sf:/", "storyforge:/", "http://localhost:1420", "http://localhost:3050"],
+  trustedOrigins: [
+    "sf:/",
+    "storyforge:/",
+    "http://localhost:1420",
+    "http://localhost:3050",
+    "tauri://localhost",
+  ],
   socialProviders: configuredProviders,
   plugins: [
     twoFactor(),
