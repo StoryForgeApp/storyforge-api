@@ -1,0 +1,12 @@
+node_modules
+server
+.env
+.git
+.gitignore
+.DS_Store
+*.log
+*.zip
+*.tar.gz
+*.tgz
+drizzle
+README.md
