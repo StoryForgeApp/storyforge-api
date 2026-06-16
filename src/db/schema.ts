@@ -174,6 +174,7 @@ export const modpack = sqliteTable("modpack", {
   owner: text("owner")
     .notNull()
     .references(() => user.id, { onDelete: "set null" }),
+  public: integer("public", { mode: "boolean" }).default(true).notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)
     .notNull(),

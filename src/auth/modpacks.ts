@@ -3,7 +3,7 @@ import type { BetterAuthPlugin } from "better-auth";
 import { z } from "zod";
 import { db } from "../db";
 import { modpack, modpackVersion } from "../db/schema";
-import { eq, exists, or, sql } from "drizzle-orm";
+import { and, eq, exists, or, sql } from "drizzle-orm";
 
 // ─── R2 delete helper (upload is handled by Elysia route) ────────────
 
@@ -85,6 +85,10 @@ export const modpacks: BetterAuthPlugin = {
             field: "id",
             onDelete: "set null",
           },
+        },
+        public: {
+          type: "boolean",
+          defaultValue: true,
         },
         createdAt: {
           type: "date",
@@ -211,7 +215,12 @@ export const modpacks: BetterAuthPlugin = {
         const where =
           // Always require versions — except for the current user's own modpacks
           or(
-            exists(db.select().from(modpackVersion).where(eq(modpack.id, modpackVersion.modpack))),
+            and(
+              exists(
+                db.select().from(modpackVersion).where(eq(modpack.id, modpackVersion.modpack)),
+              ),
+              eq(modpack.public, true),
+            ),
             sessionUserId ? eq(modpack.owner, sessionUserId) : undefined,
           );
 

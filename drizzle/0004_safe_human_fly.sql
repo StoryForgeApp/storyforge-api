@@ -1,0 +1,1 @@
+ALTER TABLE `modpack` ADD `public` integer DEFAULT false NOT NULL;

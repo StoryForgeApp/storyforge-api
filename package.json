@@ -5,7 +5,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "bun run --watch src/index.ts",
     "build": "bun build --compile --minify-whitespace --minify-syntax --outfile server src/index.ts",
-    "auth:generate": "bun x --bun auth@latest generate --output src/db/schema.ts --dialect sqlite --adapter drizzle -y && bun db:generate",
+    "auth:generate": "bun x --bun auth@latest generate --config src/auth.ts --output src/db/schema.ts --dialect sqlite --adapter drizzle -y && bun db:generate",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate"
   },
