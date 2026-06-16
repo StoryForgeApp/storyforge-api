@@ -534,6 +534,7 @@ function inspectZip(buf: Buffer): ZipInfo | null {
 const app = new Elysia()
   // Enable CORS for all routes
   .use(cors())
+  .get("/", () => ({ ok: true }))
   .mount(auth.handler)
   .use(
     cron({
