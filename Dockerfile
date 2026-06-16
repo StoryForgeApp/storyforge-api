@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 oven/bun:1 AS build
+FROM oven/bun:1 AS build
 
 RUN apt-get update && \
     apt-get install -y zip && \
@@ -13,7 +13,7 @@ COPY src ./src
 
 RUN bun build --compile --minify-whitespace --minify-syntax --outfile server src/index.ts
 
-FROM --platform=linux/amd64 debian:trixie-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && \
     apt-get install -y zip curl libboost-iostreams1.83.0 libboost-filesystem1.83.0 libboost-program-options1.83.0 && \
