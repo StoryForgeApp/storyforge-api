@@ -1,0 +1,8 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3050:3050"
+    env_file:
+      - .env
+    restart: unless-stopped
