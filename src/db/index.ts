@@ -1,4 +1,4 @@
-import { drizzle } from "drizzle-orm/libsql";
+import { drizzle } from "drizzle-orm/libsql/web";
 import * as schema from "./schema";
 
 if (!Bun.env.TURSO_DATABASE_URL || !Bun.env.TURSO_AUTH_TOKEN) {
