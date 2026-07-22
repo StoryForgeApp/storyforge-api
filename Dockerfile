@@ -16,7 +16,7 @@ RUN bun build --compile --minify-whitespace --minify-syntax --outfile server src
 FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
 
 RUN apt-get update && \
-    apt-get install -y zip curl && \
+    apt-get install -y zip curl libboost-iostreams1.83.0 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --shell /bin/bash appuser
