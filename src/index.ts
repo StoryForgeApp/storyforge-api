@@ -12,6 +12,8 @@ import { auth } from "./auth";
 import { db } from "./db";
 import { modpack } from "./db/schema";
 import { eq } from "drizzle-orm";
+import { checkLimit } from "./rateLimit";
+import { verifyPendingFiles } from "./moddbWorker";
 
 // ─── Rate limiter ───────────────────────────────────────────────────
 
@@ -21,16 +23,12 @@ const QUERY_RATE_WINDOW = 60; // seconds
 async function checkRateLimit(
   ip: string,
 ): Promise<{ allowed: boolean; remaining: number; reset: number }> {
-  const key = `ratelimit:query:${ip}`;
-  const count = await redis.incr(key);
-  if (count === 1) {
-    await redis.expire(key, QUERY_RATE_WINDOW);
-  }
-  const remaining = Math.max(0, QUERY_RATE_LIMIT - count);
-  return { allowed: count <= QUERY_RATE_LIMIT, remaining, reset: QUERY_RATE_WINDOW };
+  const result = await checkLimit("query", ip, QUERY_RATE_LIMIT, QUERY_RATE_WINDOW);
+  return { allowed: result.allowed, remaining: result.remaining, reset: result.retryAfter };
 }
 
 const buildLock = new JobLock(30 * 60 * 1000); // 30m TTL, adjust if needed
+const hashVerifyLock = new JobLock(10 * 60 * 1000);
 
 const R2_ACCOUNT_ID = Bun.env.R2_ACCOUNT_ID!;
 const R2_ACCESS_KEY_ID = Bun.env.R2_ACCESS_KEY_ID!;
@@ -560,6 +558,31 @@ const app = new Elysia()
       },
     }),
   )
+  .use(
+    cron({
+      name: "verify-mod-hashes",
+      pattern: Patterns.EVERY_5_MINUTES,
+      run: async () => {
+        if (hashVerifyLock.isLocked) {
+          console.log(`[${new Date().toISOString()}] Cron: hash verify skipped (already running)`);
+          return;
+        }
+        const release = await hashVerifyLock.acquire();
+        try {
+          const processed = await verifyPendingFiles(5);
+          if (processed > 0) {
+            console.log(
+              `[${new Date().toISOString()}] Cron: hash verification processed ${processed} file(s)`,
+            );
+          }
+        } catch (e) {
+          console.error(`[${new Date().toISOString()}] Cron: hash verification failed`, e);
+        } finally {
+          release();
+        }
+      },
+    }),
+  )
   .get("/mod/:modid", async ({ params: { modid } }) => {
     const cacheKey = `vsapi:mod:${modid}`;
     const cached = await redis.get(cacheKey);
@@ -819,6 +842,8 @@ const app = new Elysia()
       }
 
       const buffer = Buffer.from(await modConfigFile.arrayBuffer());
+      const modConfigsSha256 = new Bun.CryptoHasher("sha256").update(buffer).digest("hex");
+      const modConfigsSize = buffer.byteLength;
 
       // ── Zip bomb detection ────────────────────────────────────
       const zipInfo = inspectZip(buffer);
@@ -865,7 +890,7 @@ const app = new Elysia()
       }
 
       const url = publicUrlFor(key);
-      return { url, key };
+      return { url, key, sha256: modConfigsSha256, size: modConfigsSize };
     },
     {
       params: t.Object({

@@ -4,6 +4,15 @@ import { z } from "zod";
 import { db } from "../db";
 import { modpack, modpackVersion } from "../db/schema";
 import { and, eq, exists, or, sql } from "drizzle-orm";
+import { getManifestForVersion, recomputeManifestHash } from "../manifest";
+import {
+  ManifestInputError,
+  replaceManifestFiles,
+  resolveManifestMods,
+  type ManifestModInput,
+  type ResolvedFile,
+} from "../manifestWrite";
+import { checkLimit } from "../rateLimit";
 
 // ─── R2 delete helper (upload is handled by Elysia route) ────────────
 
@@ -34,6 +43,77 @@ const SemVer = z
     /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/,
     "Invalid semantic version",
   );
+
+const ManifestModBody = z.object({
+  modId: z.number().int().positive(),
+  releaseId: z.number().int().positive().optional(),
+  fileId: z.number().int().positive(),
+  url: z.string().min(1),
+  filename: z.string().optional(),
+  required: z.boolean().optional(),
+  side: z.enum(["client", "server", "both"]).optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+const ManifestModsBody = z.array(ManifestModBody).min(1).max(500);
+
+type ErrorCtx = {
+  error: (status: any, body?: { message?: string }) => any;
+};
+
+function manifestErrorResponse(ctx: ErrorCtx, error: unknown): any {
+  if (error instanceof ManifestInputError) {
+    const status =
+      error.status === 409
+        ? "CONFLICT"
+        : error.status === 422
+          ? "UNPROCESSABLE_ENTITY"
+          : "BAD_REQUEST";
+    return ctx.error(status, { message: error.message });
+  }
+  throw error;
+}
+
+/** Resolves a pack + version from route params (drizzle, not the auth adapter). */
+async function resolvePackAndVersion(params: { slug: string; version: string }) {
+  const pack = (
+    await db.select().from(modpack).where(eq(modpack.slug, params.slug)).limit(1)
+  )[0];
+  if (!pack) return null;
+  const version = (
+    await db
+      .select()
+      .from(modpackVersion)
+      .where(and(eq(modpackVersion.modpack, pack.id), eq(modpackVersion.version, params.version)))
+      .limit(1)
+  )[0];
+  if (!version) return null;
+  return { pack, version };
+}
+
+/** Persists structured manifest fields + rows; returns whether anything changed. */
+async function applyManifestWrite(
+  versionId: string,
+  mods: ManifestModInput[] | undefined,
+  gameVersion: string | null,
+  extra: Record<string, unknown>,
+): Promise<boolean> {
+  let resolvedRows: ResolvedFile[] | null = null;
+  if (mods) {
+    resolvedRows = await resolveManifestMods(mods, gameVersion);
+    extra.manifestVersion = 1;
+  }
+  if (resolvedRows) {
+    await replaceManifestFiles(versionId, resolvedRows);
+  }
+  if (Object.keys(extra).length > 0) {
+    await db.update(modpackVersion).set(extra).where(eq(modpackVersion.id, versionId));
+  }
+  if (resolvedRows) {
+    await recomputeManifestHash(versionId);
+  }
+  return resolvedRows != null || Object.keys(extra).length > 0;
+}
 
 // ─── Plugin ─────────────────────────────────────────────────────────
 
@@ -786,6 +866,152 @@ export const modpacks: BetterAuthPlugin = {
       },
     ),
 
+    getModpackManifest: createAuthEndpoint(
+      "/modpacks/:slug/versions/:version/manifest",
+      {
+        method: "GET",
+        metadata: {
+          openapi: {
+            description:
+              "Returns the structured manifest for a modpack version. " +
+              "Structured manifests (manifestVersion 1) include mod file URLs, sha256 hashes, and sizes. " +
+              "Legacy versions return manifestVersion 0 with the original modsString passthrough. " +
+              "Private modpacks are only visible to their owner.",
+            parameters: [
+              { name: "slug", in: "path", required: true, schema: { type: "string" } },
+              { name: "version", in: "path", required: true, schema: { type: "string" } },
+            ],
+            responses: {
+              200: { description: "Manifest found" },
+              304: { description: "Not modified (ETag match)" },
+              404: { description: "Modpack or version not found" },
+            },
+          },
+        },
+      },
+      async (ctx) => {
+        const found = await resolvePackAndVersion(ctx.params);
+        if (!found) return ctx.error("NOT_FOUND", { message: "Version not found" });
+        const { pack, version } = found;
+
+        const session = await getSessionFromCtx(ctx);
+        const isOwner = session?.user?.id === pack.owner;
+        if (!pack.public && !isOwner) {
+          return ctx.error("NOT_FOUND", { message: "Version not found" });
+        }
+
+        const manifest = await getManifestForVersion(version.id);
+        if (!manifest) return ctx.error("NOT_FOUND", { message: "Version not found" });
+
+        const cacheControl = pack.public ? "public, max-age=300" : "private, no-store";
+        if (manifest.manifestVersion === 1) {
+          const etag = `"sha256-${manifest.manifestHash}"`;
+          if (ctx.request?.headers.get("if-none-match") === etag) {
+            return new Response(null, {
+              status: 304,
+              headers: { ETag: etag, "Cache-Control": cacheControl },
+            });
+          }
+          return ctx.json(manifest, {
+            headers: { ETag: etag, "Cache-Control": cacheControl },
+          });
+        }
+        return ctx.json(manifest, { headers: { "Cache-Control": cacheControl } });
+      },
+    ),
+
+    putModpackManifest: createAuthEndpoint(
+      "/modpacks/:slug/versions/:version/manifest",
+      {
+        method: "PUT",
+        use: [sessionMiddleware],
+        body: z.object({
+          mods: ManifestModsBody,
+          changelog: z.string().max(10_000).optional(),
+        }),
+        metadata: {
+          openapi: {
+            description:
+              "Replaces the structured manifest of a modpack version. Requires ownership. " +
+              "Mod metadata (name, version, filename, game versions) is resolved server-side from " +
+              "the moddb API and validated against the moddb CDN. Hash verification is queued.",
+            parameters: [
+              { name: "slug", in: "path", required: true, schema: { type: "string" } },
+              { name: "version", in: "path", required: true, schema: { type: "string" } },
+            ],
+            requestBody: {
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["mods"],
+                    properties: {
+                      mods: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          properties: {
+                            modId: { type: "number" },
+                            releaseId: { type: "number" },
+                            fileId: { type: "number" },
+                            url: { type: "string" },
+                            filename: { type: "string" },
+                            required: { type: "boolean" },
+                            side: { type: "string", enum: ["client", "server", "both"] },
+                            sortOrder: { type: "number" },
+                          },
+                          required: ["modId", "fileId", "url"],
+                        },
+                      },
+                      changelog: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+            responses: {
+              200: { description: "Manifest replaced and returned" },
+              400: { description: "Unknown modId or fileId" },
+              401: { description: "Unauthorized – session required or not the owner" },
+              404: { description: "Modpack or version not found" },
+              409: { description: "Duplicate modId or fileId" },
+              422: { description: "URL host not allowed or does not match moddb" },
+              429: { description: "Rate limited" },
+            },
+          },
+        },
+      },
+      async (ctx) => {
+        if (!ctx.context.session) return ctx.error("UNAUTHORIZED");
+        const userId = ctx.context.session.user.id;
+
+        const rl = await checkLimit("manifest:write", userId, 30, 60);
+        if (!rl.allowed) {
+          return ctx.error("TOO_MANY_REQUESTS", { message: "Too many manifest updates" });
+        }
+
+        const found = await resolvePackAndVersion(ctx.params);
+        if (!found) return ctx.error("NOT_FOUND", { message: "Version not found" });
+        const { pack, version } = found;
+        if (pack.owner !== userId) return ctx.error("UNAUTHORIZED");
+
+        try {
+          const extra: Record<string, unknown> = {};
+          if (ctx.body.changelog != null) extra.changelog = ctx.body.changelog;
+          await applyManifestWrite(
+            version.id,
+            ctx.body.mods,
+            version.gameVersion ?? null,
+            extra,
+          );
+          const manifest = await recomputeManifestHash(version.id);
+          return ctx.json(manifest ?? { ok: true });
+        } catch (error) {
+          return manifestErrorResponse(ctx, error);
+        }
+      },
+    ),
+
     incrementDownload: createAuthEndpoint(
       "/modpacks/:slug/versions/:version/download",
       {
@@ -860,7 +1086,11 @@ export const modpacks: BetterAuthPlugin = {
           version: SemVer,
           gameVersion: SemVer,
           modsString: z.string().optional(),
+          mods: ManifestModsBody.optional(),
+          changelog: z.string().max(10_000).optional(),
           modConfigsUrl: z.string().optional(),
+          modConfigsSha256: z.string().optional(),
+          modConfigsSize: z.number().int().nonnegative().optional(),
           imageUrl: z.string().optional(),
         }),
         metadata: {
@@ -917,13 +1147,19 @@ export const modpacks: BetterAuthPlugin = {
       },
       async (ctx) => {
         if (!ctx.context.session) return ctx.error("UNAUTHORIZED");
+        const userId = ctx.context.session.user.id;
+
+        const rl = await checkLimit("modpack:version:write", userId, 10, 60);
+        if (!rl.allowed) {
+          return ctx.error("TOO_MANY_REQUESTS", { message: "Too many version writes" });
+        }
 
         const modpack = await ctx.context.adapter.findOne<Modpack>({
           model: "modpack",
           where: [{ field: "slug", value: ctx.params.slug, operator: "eq" }],
         });
         if (!modpack) return ctx.error("NOT_FOUND", { message: "Modpack not found" });
-        if (modpack.owner !== ctx.context.session.user.id)
+        if (modpack.owner !== userId)
           return ctx.error("UNAUTHORIZED", { message: "You must own the modpack" });
 
         // Check for duplicate version
@@ -937,7 +1173,16 @@ export const modpacks: BetterAuthPlugin = {
         if (existing)
           return ctx.error("CONFLICT", { message: "This version already exists for this modpack" });
 
-        const result = await ctx.context.adapter.create({
+        let resolvedRows: ResolvedFile[] | null = null;
+        try {
+          if (ctx.body.mods) {
+            resolvedRows = await resolveManifestMods(ctx.body.mods, ctx.body.gameVersion ?? null);
+          }
+        } catch (error) {
+          return manifestErrorResponse(ctx, error);
+        }
+
+        const result = (await ctx.context.adapter.create({
           model: "modpackVersion",
           data: {
             version: ctx.body.version,
@@ -947,9 +1192,31 @@ export const modpacks: BetterAuthPlugin = {
             imageUrl: ctx.body.imageUrl,
             modpack: modpack.id,
           },
-        });
+        })) as { id?: string } | null;
 
-        return ctx.json(result);
+        const versionId = result?.id;
+        if (!versionId) return ctx.json(result);
+
+        const extra: Record<string, unknown> = {};
+        if (resolvedRows) extra.manifestVersion = 1;
+        if (ctx.body.changelog != null) extra.changelog = ctx.body.changelog;
+        if (ctx.body.modConfigsSha256 != null) {
+          extra.modConfigsSha256 = ctx.body.modConfigsSha256;
+        }
+        if (ctx.body.modConfigsSize != null) {
+          extra.modConfigsSize = ctx.body.modConfigsSize;
+        }
+
+        if (resolvedRows) await replaceManifestFiles(versionId, resolvedRows);
+        if (Object.keys(extra).length > 0) {
+          await db.update(modpackVersion).set(extra).where(eq(modpackVersion.id, versionId));
+        }
+        if (resolvedRows) await recomputeManifestHash(versionId);
+
+        const fresh = (
+          await db.select().from(modpackVersion).where(eq(modpackVersion.id, versionId)).limit(1)
+        )[0];
+        return ctx.json(fresh ?? result);
       },
     ),
 
@@ -962,7 +1229,11 @@ export const modpacks: BetterAuthPlugin = {
           version: SemVer.optional(),
           gameVersion: SemVer.optional(),
           modsString: z.string().optional(),
+          mods: ManifestModsBody.optional(),
+          changelog: z.string().max(10_000).optional(),
           modConfigsUrl: z.string().optional(),
+          modConfigsSha256: z.string().optional(),
+          modConfigsSize: z.number().int().nonnegative().optional(),
           imageUrl: z.string().optional(),
         }),
         metadata: {
@@ -1001,13 +1272,19 @@ export const modpacks: BetterAuthPlugin = {
       },
       async (ctx) => {
         if (!ctx.context.session) return ctx.error("UNAUTHORIZED");
+        const userId = ctx.context.session.user.id;
+
+        const rl = await checkLimit("modpack:version:write", userId, 10, 60);
+        if (!rl.allowed) {
+          return ctx.error("TOO_MANY_REQUESTS", { message: "Too many version writes" });
+        }
 
         const modpack = await ctx.context.adapter.findOne<Modpack>({
           model: "modpack",
           where: [{ field: "slug", value: ctx.params.slug, operator: "eq" }],
         });
         if (!modpack) return ctx.error("NOT_FOUND", { message: "Modpack not found" });
-        if (modpack.owner !== ctx.context.session.user.id) return ctx.error("UNAUTHORIZED");
+        if (modpack.owner !== userId) return ctx.error("UNAUTHORIZED");
 
         const versionRecord = await ctx.context.adapter.findOne({
           model: "modpackVersion",
@@ -1017,6 +1294,11 @@ export const modpacks: BetterAuthPlugin = {
           ],
         });
         if (!versionRecord) return ctx.error("NOT_FOUND", { message: "Version not found" });
+
+        const currentVersion = versionRecord as {
+          id: string;
+          gameVersion?: string | null;
+        };
 
         const update: Record<string, unknown> = {};
 
@@ -1038,18 +1320,61 @@ export const modpacks: BetterAuthPlugin = {
           update.version = ctx.body.version;
         }
 
-        if (Object.keys(update).length === 0) return ctx.json(versionRecord);
+        // Structured fields go through drizzle: better-auth's adapter drops
+        // columns not declared in the plugin schema.
+        const extra: Record<string, unknown> = {};
+        let resolvedRows: ResolvedFile[] | null = null;
+        if (ctx.body.mods) {
+          try {
+            resolvedRows = await resolveManifestMods(
+              ctx.body.mods,
+              ctx.body.gameVersion ?? currentVersion.gameVersion ?? null,
+            );
+          } catch (error) {
+            return manifestErrorResponse(ctx, error);
+          }
+          extra.manifestVersion = 1;
+        }
+        if (ctx.body.changelog != null) extra.changelog = ctx.body.changelog;
+        if (ctx.body.modConfigsSha256 != null) {
+          extra.modConfigsSha256 = ctx.body.modConfigsSha256;
+        }
+        if (ctx.body.modConfigsSize != null) {
+          extra.modConfigsSize = ctx.body.modConfigsSize;
+        }
 
-        const result = await ctx.context.adapter.update<ModpackVersion>({
-          model: "modpackVersion",
-          where: [
-            { field: "modpack", value: modpack.id, operator: "eq", connector: "AND" },
-            { field: "version", value: ctx.params.version, operator: "eq" },
-          ],
-          update,
-        });
+        if (Object.keys(update).length === 0 && Object.keys(extra).length === 0) {
+          return ctx.json(versionRecord);
+        }
 
-        return ctx.json(result);
+        if (Object.keys(update).length > 0) {
+          await ctx.context.adapter.update<ModpackVersion>({
+            model: "modpackVersion",
+            where: [
+              { field: "modpack", value: modpack.id, operator: "eq", connector: "AND" },
+              { field: "version", value: ctx.params.version, operator: "eq" },
+            ],
+            update,
+          });
+        }
+
+        if (resolvedRows) await replaceManifestFiles(currentVersion.id, resolvedRows);
+        if (Object.keys(extra).length > 0) {
+          await db
+            .update(modpackVersion)
+            .set(extra)
+            .where(eq(modpackVersion.id, currentVersion.id));
+        }
+        if (resolvedRows) await recomputeManifestHash(currentVersion.id);
+
+        const fresh = (
+          await db
+            .select()
+            .from(modpackVersion)
+            .where(eq(modpackVersion.id, currentVersion.id))
+            .limit(1)
+        )[0];
+        return ctx.json(fresh ?? versionRecord);
       },
     ),
 

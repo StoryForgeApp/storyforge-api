@@ -193,6 +193,11 @@ export const modpackVersion = sqliteTable("modpack_version", {
   gameVersion: text("game_version"),
   downloads: integer("downloads").default(0).notNull(),
   imageUrl: text("image_url"),
+  manifestVersion: integer("manifest_version").default(0).notNull(),
+  manifestHash: text("manifest_hash"),
+  changelog: text("changelog"),
+  modConfigsSha256: text("mod_configs_sha256"),
+  modConfigsSize: integer("mod_configs_size"),
   modpack: text("modpack")
     .notNull()
     .references(() => modpack.id, { onDelete: "cascade" }),
@@ -202,6 +207,55 @@ export const modpackVersion = sqliteTable("modpack_version", {
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).$onUpdate(
     () => new Date(),
   ),
+});
+
+export const modpackFile = sqliteTable(
+  "modpack_file",
+  {
+    id: text("id").primaryKey(),
+    modpackVersion: text("modpack_version")
+      .notNull()
+      .references(() => modpackVersion.id, { onDelete: "cascade" }),
+    modId: integer("mod_id").notNull(),
+    modIdStr: text("mod_id_str").notNull(),
+    name: text("name").notNull(),
+    modVersion: text("mod_version").notNull(),
+    releaseId: integer("release_id"),
+    fileId: integer("file_id").notNull(),
+    filename: text("filename").notNull(),
+    url: text("url").notNull(),
+    sha256: text("sha256"),
+    size: integer("size"),
+    side: text("side").notNull().default("both"),
+    required: integer("required", { mode: "boolean" }).notNull().default(true),
+    gameVersions: text("game_versions"),
+    compatible: integer("compatible", { mode: "boolean" }),
+    sortOrder: integer("sort_order").notNull().default(0),
+    createdAt: integer("created_at", { mode: "timestamp_ms" })
+      .default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("modpack_file_version_mod_uidx").on(table.modpackVersion, table.modId),
+    index("modpack_file_version_idx").on(table.modpackVersion),
+    index("modpack_file_modId_idx").on(table.modId),
+    index("modpack_file_fileId_idx").on(table.fileId),
+  ],
+);
+
+export const moddbFile = sqliteTable("moddb_file", {
+  fileId: integer("file_id").primaryKey(),
+  url: text("url").notNull(),
+  filename: text("filename").notNull(),
+  size: integer("size"),
+  sha256: text("sha256"),
+  status: text("status").notNull().default("pending"),
+  attempts: integer("attempts").notNull().default(0),
+  verifiedAt: integer("verified_at", { mode: "timestamp_ms" }),
+  lastAttemptAt: integer("last_attempt_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)
+    .notNull(),
 });
 
 export const userRelations = relations(user, ({ many }) => ({
@@ -269,9 +323,17 @@ export const modpackRelations = relations(modpack, ({ one, many }) => ({
   modpackVersions: many(modpackVersion),
 }));
 
-export const modpackVersionRelations = relations(modpackVersion, ({ one }) => ({
+export const modpackVersionRelations = relations(modpackVersion, ({ one, many }) => ({
   modpack: one(modpack, {
     fields: [modpackVersion.modpack],
     references: [modpack.id],
+  }),
+  modpackFiles: many(modpackFile),
+}));
+
+export const modpackFileRelations = relations(modpackFile, ({ one }) => ({
+  modpackVersion: one(modpackVersion, {
+    fields: [modpackFile.modpackVersion],
+    references: [modpackVersion.id],
   }),
 }));
