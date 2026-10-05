@@ -660,6 +660,132 @@ const app = new Elysia()
 
     return modtags;
   })
+  .get("/releases/latest", async () => {
+    // Proxy for the GitHub releases API: browsers hit GitHub's unauthenticated
+    // rate limit (60/h/IP), so the website reads from here instead. Cached for
+    // 15 minutes with a stale copy served if GitHub is unavailable.
+    const cacheKey = "vsapi:releases:latest";
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      try {
+        return JSON.parse(cached);
+      } catch {}
+    }
+
+    const headers: Record<string, string> = { accept: "application/vnd.github+json" };
+    if (Bun.env.GITHUB_TOKEN) headers.authorization = `Bearer ${Bun.env.GITHUB_TOKEN}`;
+
+    try {
+      const response = await fetch(
+        "https://api.github.com/repos/lovelesscodes/storyforge/releases/latest",
+        { headers },
+      );
+      if (!response.ok) throw new Error(`GitHub responded ${response.status}`);
+
+      const release = (await response.json()) as {
+        tag_name: string;
+        html_url: string;
+        published_at: string | null;
+        assets: {
+          name: string;
+          browser_download_url: string;
+          size: number;
+          download_count: number;
+        }[];
+      };
+
+      const payload = {
+        version: release.tag_name,
+        url: release.html_url,
+        publishedAt: release.published_at,
+        assets: (release.assets ?? [])
+          .filter((asset) => asset.name !== "latest.json" && !asset.name.endsWith(".sig"))
+          .map((asset) => ({
+            name: asset.name,
+            url: asset.browser_download_url,
+            size: asset.size,
+            downloads: asset.download_count,
+          })),
+      };
+
+      await redis.set(cacheKey, JSON.stringify(payload), "EX", 900);
+      await redis.set(`${cacheKey}:stale`, JSON.stringify(payload));
+      return payload;
+    } catch (error) {
+      const stale = await redis.get(`${cacheKey}:stale`);
+      if (stale) {
+        try {
+          return JSON.parse(stale);
+        } catch {}
+      }
+      throw error;
+    }
+  })
+  .get("/github/stats", async () => {
+    // Repo stats for the marketing site (stars, forks, total downloads).
+    const cacheKey = "vsapi:github:stats";
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      try {
+        return JSON.parse(cached);
+      } catch {}
+    }
+
+    const headers: Record<string, string> = { accept: "application/vnd.github+json" };
+    if (Bun.env.GITHUB_TOKEN) headers.authorization = `Bearer ${Bun.env.GITHUB_TOKEN}`;
+
+    try {
+      const [repoResponse, releasesResponse] = await Promise.all([
+        fetch("https://api.github.com/repos/lovelesscodes/storyforge", { headers }),
+        fetch("https://api.github.com/repos/lovelesscodes/storyforge/releases?per_page=100", {
+          headers,
+        }),
+      ]);
+      if (!repoResponse.ok) throw new Error(`GitHub responded ${repoResponse.status}`);
+
+      const repo = (await repoResponse.json()) as {
+        stargazers_count: number;
+        forks_count: number;
+      };
+      const releases = releasesResponse.ok
+        ? ((await releasesResponse.json()) as {
+            assets: { name: string; download_count: number }[];
+          }[])
+        : [];
+
+      const downloads = releases.reduce(
+        (sum, release) =>
+          sum +
+          release.assets.reduce(
+            (assetSum, asset) =>
+              assetSum +
+              (asset.name !== "latest.json" && !asset.name.endsWith(".sig")
+                ? asset.download_count
+                : 0),
+            0,
+          ),
+        0,
+      );
+
+      const payload = {
+        stars: repo.stargazers_count,
+        forks: repo.forks_count,
+        downloads,
+      };
+
+      await redis.set(cacheKey, JSON.stringify(payload), "EX", 3600);
+      await redis.set(`${cacheKey}:stale`, JSON.stringify(payload));
+      return payload;
+    } catch (error) {
+      const stale = await redis.get(`${cacheKey}:stale`);
+      if (stale) {
+        try {
+          return JSON.parse(stale);
+        } catch {}
+      }
+      throw error;
+    }
+  })
   .get("/versions", async () => {
     const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     return Object.keys(versions);
