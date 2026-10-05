@@ -23,12 +23,23 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
   },
+  advanced: {
+    // The website (getstoryforge.app) is a cross-site client of this API,
+    // so session cookies must be SameSite=None to be sent along.
+    defaultCookieAttributes: {
+      sameSite: "none",
+      secure: true,
+    },
+  },
   trustedOrigins: [
     "sf:/",
     "storyforge:/",
     "http://localhost:1420",
     "http://localhost:3050",
+    "http://localhost:5173",
     "tauri://localhost",
+    "https://getstoryforge.app",
+    "https://www.getstoryforge.app",
   ],
   socialProviders: configuredProviders,
   plugins: [
