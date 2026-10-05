@@ -43,6 +43,13 @@
       "when": 1781613893503,
       "tag": "0005_lame_thanos",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1791199368121,
+      "tag": "0006_far_loners",
+      "breakpoints": true
     }
   ]
 }
