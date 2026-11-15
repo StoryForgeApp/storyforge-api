@@ -37,6 +37,13 @@ const R2_BUCKET = Bun.env.R2_BUCKET!; // e.g., "my-game"
 const R2_PUBLIC_BASE = Bun.env.R2_PUBLIC_BASE!; // e.g., "https://cdn.example.com/game"
 const INNOEXTRACT_BIN = Bun.env.INNOEXTRACT_BIN || "./innoextract";
 const REDIS_URL = Bun.env.REDIS_URL || undefined;
+// Public base URL of this API, e.g. "https://api.getstoryforge.app". Only
+// needed when the reverse proxy does not forward X-Forwarded-Host/Proto; game
+// download links handed to clients are built from it.
+const PUBLIC_BASE_URL = (Bun.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+// A presigned R2 URL only has to outlive a single download: clients keep the
+// API URL and follow a fresh redirect when they resume.
+const WINDOWS_ZIP_URL_TTL = 60 * 60;
 
 if (
   !R2_ACCOUNT_ID ||
@@ -56,8 +63,9 @@ const s3 = new Bun.S3Client({
   bucket: R2_BUCKET,
 });
 
-// Minimal cache to avoid duplicate builds within process lifetime
-const builtCache = new Map<string, string>(); // version -> public URL
+// Versions whose launcher-ready Windows zip exists in R2. The URL is built per
+// request, so this cache stays valid across domains and deployments.
+const builtCache = new Set<string>(); // version
 
 type DownloadLinks = {
   windows: string | null;
@@ -303,6 +311,44 @@ function publicUrlFor(key: string) {
   return `${R2_PUBLIC_BASE.replace(/\/+$/, "")}/${key.replace(/^\/+/, "")}`;
 }
 
+/**
+ * Public URL of the launcher-ready Windows zip.
+ *
+ * This points at this API, not at the bucket: the bucket host is deployment
+ * configuration that has already outlived one brand, and Windows downloads
+ * broke for every user when it did. `/gamefiles/:version/windows.zip` redirects
+ * to a presigned R2 URL, so the host clients see is the API host.
+ */
+function windowsZipUrl(baseUrl: string, version: string): string {
+  return `${baseUrl}/gamefiles/${encodeURIComponent(version)}/windows.zip`;
+}
+
+/**
+ * Base URL clients should use to reach this API.
+ *
+ * `PUBLIC_BASE_URL` wins when set. Otherwise trust the reverse proxy headers,
+ * then fall back to this request's host.
+ */
+function publicBaseUrl(request: Request): string {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+
+  const forwardedHost = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+  if (forwardedHost) {
+    const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+    return `${forwardedProto || "https"}://${forwardedHost}`;
+  }
+
+  const url = new URL(request.url);
+  // The proxy terminates TLS, so the local server only ever sees http. Keep it
+  // for local development and upgrade every other host.
+  return /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(url.host) ? url.origin : `https://${url.host}`;
+}
+
+/** Versions are `MAJOR.MINOR.PATCH`, optionally with a pre-release suffix. */
+function isGameVersion(version: string): boolean {
+  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version);
+}
+
 async function downloadToFile(url: string, outPath: string) {
   const res = await fetch(url, { redirect: "follow" });
   if (!res.ok || !res.body) {
@@ -337,17 +383,16 @@ function windowsZipKey(version: string): string {
   return `${version}/windows.zip`; // path layout in bucket
 }
 
-// Core: ensure windows zip exists in R2 for a version, building if needed
-async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise<string> {
-  if (builtCache.has(version)) return builtCache.get(version)!;
+// Core: ensure the launcher-ready Windows zip for a version exists in R2,
+// building it from the official installer if needed.
+async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise<void> {
+  if (builtCache.has(version)) return;
 
   const key = windowsZipKey(version);
-  const exists = await r2Head(key);
-  if (exists) {
-    const url = publicUrlFor(key);
-    builtCache.set(version, url);
-    console.log(`Found existing windows zip for ${version} - ${url}`);
-    return url;
+  if (await r2Head(key)) {
+    builtCache.add(version);
+    console.log(`Found existing windows zip for ${version}`);
+    return;
   }
   console.log(`Building windows zip for ${version}...`);
 
@@ -378,62 +423,53 @@ async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise
     const zipData = await readFile(zipPath);
     await r2Put(key, zipData, "application/zip", "public-read");
 
-    const url = publicUrlFor(key);
-    builtCache.set(version, url);
-    return url;
+    builtCache.add(version);
   } finally {
     // Clean temp directory
     await rm(workDir, { recursive: true, force: true });
   }
 }
 
-// Get latest versions + resolve Windows zip URL (R2 or build-on-demand)
-async function getVersionsWithResolvedWindowsZip(sourceUrl: string) {
+// Build every Windows zip that is still missing from R2 (run by the cron job).
+async function buildMissingWindowsZips(sourceUrl: string) {
   const versions = await parseVintageStoryDownloads(sourceUrl);
-  // Build a normalized output structure
-  const out: Record<string, DownloadLinks & { windows_zip?: string | null }> = {};
 
   for (const [version, links] of Object.entries(versions)) {
-    out[version] = { ...links, windows_zip: null };
-
-    // We only act if we have a Windows installer link to transform
-    if (links.windows && /\.exe(\?|$)/i.test(links.windows)) {
-      try {
-        const r2Url = await ensureWindowsZip(version, links.windows);
-        out[version].windows_zip = r2Url;
-      } catch (e) {
-        console.error(`Failed to build windows zip for ${version}:`, e);
-        // Leave windows_zip null; caller may fall back to installer if desired
-      }
-    } else if (links.windows && /\.zip(\?|$)/i.test(links.windows)) {
-      // In case upstream already provides zip
-      out[version].windows_zip = links.windows;
-    } else {
+    // The official Windows channel only ships an installer; the zip is built
+    // from it so the launcher has something it can extract.
+    if (!links.windows || !/\.exe(\?|$)/i.test(links.windows)) {
       console.log(`No Windows installer link for ${version}, skipping windows zip build.`);
+      continue;
+    }
+    try {
+      await ensureWindowsZip(version, links.windows);
+    } catch (e) {
+      console.error(`Failed to build windows zip for ${version}:`, e);
+      // A failed build is retried on the next cron run.
     }
   }
-  return out;
 }
 
-// Redis-cached built windows zips (1d TTL)
-async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, string>> {
-  const cacheKey = "vsapi:builtzips:" + newest;
+// Redis-cached list of versions whose Windows zip exists in R2
+async function listBuiltWindowsZipVersions(newest: string): Promise<Set<string>> {
+  const cacheKey = "vsapi:builtzipversions:" + newest;
   const cached = await redis.get(cacheKey);
   if (cached) {
     console.log(`Cache hit for ${cacheKey}`);
     try {
-      const obj = JSON.parse(cached);
-      const sorted = Object.keys(obj).sort(semver.order).reverse();
-      console.log(`Cached built zips for versions: ${sorted.join(", ")}`);
-      if (sorted[0] !== newest) {
-        console.log(`Warning: cached newest version ${sorted[0]} differs from expected ${newest}`);
-        throw new Error("Cache inconsistency");
+      const parsed = JSON.parse(cached) as { newest?: string; versions?: string[] };
+      if (parsed.newest === newest && Array.isArray(parsed.versions)) {
+        const versions = new Set(parsed.versions);
+        console.log(
+          `Cached built zips for versions: ${[...versions].sort(semver.order).reverse().join(", ")}`,
+        );
+        return versions;
       }
-      return new Map(Object.entries(obj));
+      console.log(`Cached entry for ${cacheKey} is stale, listing R2 objects`);
     } catch {}
   }
   console.log(`Cache miss for ${cacheKey}, listing R2 objects`);
-  const out = new Map<string, string>();
+  const versions = new Set<string>();
   let ContinuationToken: string | undefined = undefined;
   do {
     const resp = await s3.list({
@@ -443,31 +479,30 @@ async function listBuiltWindowsZipsFromR2(newest: string): Promise<Map<string, s
       const key = obj.key || "";
       if (/^[^/]+\/windows\.zip$/i.test(key)) {
         const version = key.split("/", 1)[0];
-        out.set(version, publicUrlFor(key));
-        builtCache.set(version, publicUrlFor(key));
+        versions.add(version);
+        builtCache.add(version);
       }
     }
     ContinuationToken = resp.isTruncated ? resp.nextContinuationToken : undefined;
   } while (ContinuationToken);
   // Save to Redis
-  await redis.set(cacheKey, JSON.stringify(Object.fromEntries(out)), "EX", 604800); // 7d
-  return out;
+  await redis.set(cacheKey, JSON.stringify({ newest, versions: [...versions] }), "EX", 604800); // 7d
+  return versions;
 }
 
-// Merge already-built zips into parsed versions without triggering builds
-async function mergeBuiltZips(versions: Record<string, DownloadLinks>) {
+// Merge already-built zips into parsed versions without triggering builds.
+async function mergeBuiltZips(versions: Record<string, DownloadLinks>, baseUrl: string) {
   // Sort the versions from a semver perspective to get the newest
   const sorted = Object.keys(versions).sort(semver.order).reverse();
   const newest = sorted[0];
   console.log(`Merging built zips, newest version detected: ${newest}`);
-  const built = await listBuiltWindowsZipsFromR2(newest);
+  const built = await listBuiltWindowsZipVersions(newest);
   const out: Record<string, DownloadLinks> = {};
   for (const [version, links] of Object.entries(versions)) {
     out[version] = { ...links, windows: null };
-    const builtUrl = built.get(version);
-    if (builtUrl) {
+    if (built.has(version)) {
       console.log(`Found already existing windows zip for ${version}`);
-      out[version].windows = builtUrl;
+      out[version].windows = windowsZipUrl(baseUrl, version);
     } else if (links.windows && /\.zip(\?|$)/i.test(links.windows)) {
       // upstream-provided zip (rare), surface it too
       out[version].windows = links.windows;
@@ -548,7 +583,7 @@ const app = new Elysia()
           `[${new Date().toISOString()}] Cron: start refreshing versions and building missing zips`,
         );
         try {
-          await getVersionsWithResolvedWindowsZip("https://account.vintagestory.at/");
+          await buildMissingWindowsZips("https://account.vintagestory.at/");
           console.log(`[${new Date().toISOString()}] Cron: completed`);
         } catch (e) {
           console.error(`[${new Date().toISOString()}] Cron: failed`, e);
@@ -790,20 +825,20 @@ const app = new Elysia()
     const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
     return Object.keys(versions);
   })
-  .get("/download", async () => {
+  .get("/download", async ({ request }) => {
     // Return parsed links plus any already-built windows zips in R2 (Redis cached)
     const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
-    return await mergeBuiltZips(versions);
+    return await mergeBuiltZips(versions, publicBaseUrl(request));
   })
   .get(
     "/download/:version",
-    async ({ params: { version } }) => {
+    async ({ request, params: { version } }) => {
       const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
       const v = versions[version];
       if (!v) {
         return { error: "Version not found" };
       }
-      const merged = await mergeBuiltZips({ [version]: v });
+      const merged = await mergeBuiltZips({ [version]: v }, publicBaseUrl(request));
       return merged[version];
     },
     {
@@ -813,20 +848,50 @@ const app = new Elysia()
     },
   )
   .get(
+    "/gamefiles/:version/windows.zip",
+    async ({ params: { version }, redirect, set }) => {
+      if (!isGameVersion(version)) {
+        set.status = 400;
+        return { error: "Invalid version" };
+      }
+      const key = windowsZipKey(version);
+      if (!(await r2Head(key))) {
+        set.status = 404;
+        return { error: `No Windows download has been built for ${version} yet` };
+      }
+      // Presigned so the archive streams from R2 (ranges included) rather than
+      // through this server, and so no bucket hostname is baked into the URL.
+      return redirect(s3.presign(key, { method: "GET", expiresIn: WINDOWS_ZIP_URL_TTL }), 302);
+    },
+    {
+      params: t.Object({
+        version: t.String(),
+      }),
+    },
+  )
+  .get(
     "/download/:version/:platform",
-    async ({ params: { version, platform } }) => {
-      let versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
+    async ({ request, params: { version, platform }, set }) => {
+      const versions = await parseVintageStoryDownloads("https://account.vintagestory.at/");
       const v = versions[version];
       if (!v) {
         return { error: "Version not found" };
       }
       if (platform === "windows") {
-        versions = await mergeBuiltZips({ [version]: v });
+        const merged = await mergeBuiltZips({ [version]: v }, publicBaseUrl(request));
+        const url = merged[version].windows;
+        if (!url) {
+          // The zip is built from the official installer by the cron job, so a
+          // brand new release can go without one for a short while.
+          set.status = 404;
+          return { error: `No Windows download has been built for ${version} yet` };
+        }
+        return { url };
       }
       if (!(platform in v)) {
         return { error: "Invalid platform" };
       }
-      return { url: versions[version][platform] };
+      return { url: v[platform] };
     },
     {
       params: t.Object({
