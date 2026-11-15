@@ -31,6 +31,18 @@ Example response:
 }
 ```
 
+- `GET /download/:version/:platform`  
+	Returns `{ "url": "…" }` for one platform. For `windows` the URL is the
+	launcher-ready zip, which this API serves itself:
+	`GET /gamefiles/:version/windows.zip` answers `302` to a presigned R2 URL.
+	The official channel only ships an `.exe`, so the zip is built from it by a
+	two-hourly job; a version that has just been released may answer `404` until
+	its zip exists.
+
+Clients should keep the `/gamefiles/…` URL rather than the presigned one: it
+never expires, and resuming a paused download (a `Range` request) re-resolves
+to a fresh presigned URL.
+
 ## Getting Started
 
 ### Prerequisites
@@ -78,6 +90,15 @@ Create a `.env` file in the project root:
 PHPSESSID=your_php_session_id_here
 VS_WEBSESSIONKEY=your_vs_websessionkey_here
 ```
+
+The storage and cache settings are also required: `R2_ACCOUNT_ID`,
+`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_BASE` and
+`REDIS_URL`. `R2_PUBLIC_BASE` is the public bucket URL used for modpack files.
+
+Set `PUBLIC_BASE_URL` (e.g. `https://api.getstoryforge.app`) when the process
+sits behind a reverse proxy: Windows download links are built from it. Without
+it the API uses `X-Forwarded-Host`/`X-Forwarded-Proto`, then the host of the
+incoming request (upgraded to `https` unless it is loopback).
 
 ## Running the API
 
