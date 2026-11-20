@@ -1,5 +1,11 @@
 import { Elysia, t } from "elysia";
-import * as cheerio from "cheerio";
+import {
+  type DownloadLinks,
+  mergeVersionMaps,
+  parseDownloadsFromHtml,
+  parsePreviewDownloadsFromHtml,
+  previewPageUrlsFromHtml,
+} from "./downloads";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm, mkdir, stat, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -67,40 +73,17 @@ const s3 = new Bun.S3Client({
 // request, so this cache stays valid across domains and deployments.
 const builtCache = new Set<string>(); // version
 
-type DownloadLinks = {
-  windows: string | null;
-  mac: string | null;
-  mac_arm64: string | null;
-  linux: string | null;
-  linux_server: string | null;
-  windows_server: string | null;
-};
+// ─── Version list ───────────────────────────────────────────────────
 
-// Your existing parser functions here (parseVintageStoryDownloads, etc.)
 /**
- * Parse Vintage Story download links from an account downloads HTML page.
+ * Parses the downloads pages into one entry per version.
  *
- * Output shape:
- * {
- *   "<version>": {
- *     windows: "<link>" | null,
- *     mac: "<link>" | null,
- *     mac_arm64: "<link>" | null,
- *     linux: "<link>" | null,
- *     linux_server: "<link>" | null,
- *     windows_server: "<link>" | null
- *   },
- *   ...
- * }
+ * Stable and Unstable builds come from the account page. Pre-releases
+ * (`1.23.0-pre.1`) are published only on the per-minor info pages that the
+ * account page links to, so those are fetched and merged in.
  *
- * Notes:
- * - Prefers CDN links if both CDN and mirror exist.
- * - Works for both "Stable" and "Unstable" panes.
- * - Robust to minor wording/size changes in anchor text; keys are inferred
- *   from href filename patterns.
+ * Redis-cached (1h TTL): the pages are large and change rarely.
  */
-
-// Redis-cached version list (1h TTL)
 export async function parseVintageStoryDownloads(url: string): Promise<{
   [version: string]: DownloadLinks;
 }> {
@@ -112,173 +95,54 @@ export async function parseVintageStoryDownloads(url: string): Promise<{
     } catch {}
   }
   const html = await fetchText(url);
-  const parsed = parseDownloadsFromHtml(html);
+  const parsed = await mergePreviewPages(parseDownloadsFromHtml(html), html);
   await redis.set(cacheKey, JSON.stringify(parsed), "EX", 3600); // 1h
   return parsed;
 }
 
-async function fetchText(url: string): Promise<string> {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; VintageStoryDownloadParser/1.0)",
-      Cookie: `PHPSESSID=${Bun.env.PHPSESSID}; vs_websessionkey=${Bun.env.VS_WEBSESSIONKEY};`,
-    },
-  });
+/**
+ * Fetches every preview page the account page links to and merges the builds
+ * it lists. A preview page that fails never hides the stable/unstable list.
+ */
+async function mergePreviewPages(
+  versions: Record<string, DownloadLinks>,
+  accountHtml: string,
+): Promise<Record<string, DownloadLinks>> {
+  const pages = previewPageUrlsFromHtml(accountHtml);
+  if (pages.length === 0) return versions;
+
+  let merged = versions;
+  for (const page of pages) {
+    try {
+      const html = await fetchText(page, { withCookies: false });
+      merged = mergeVersionMaps(merged, parsePreviewDownloadsFromHtml(html));
+    } catch (error) {
+      console.warn(`Failed to read preview page ${page}:`, error);
+    }
+  }
+  return merged;
+}
+
+async function fetchText(
+  url: string,
+  opts: { withCookies?: boolean } = {},
+): Promise<string> {
+  const headers: Record<string, string> = {
+    "User-Agent": "Mozilla/5.0 (compatible; VintageStoryDownloadParser/1.0)",
+  };
+  // The info pages are public, so the account session never goes to them.
+  if (opts.withCookies !== false) {
+    headers.Cookie = `PHPSESSID=${Bun.env.PHPSESSID}; vs_websessionkey=${Bun.env.VS_WEBSESSIONKEY};`;
+  }
+  const res = await fetch(url, { headers });
   if (!res.ok) {
     throw new Error(`Failed to fetch ${url}: ${res.status} ${res.statusText}`);
   }
   return await res.text();
 }
 
-/**
- * Core parser: accepts raw HTML string (for testing).
- */
-export function parseDownloadsFromHtml(html: string) {
-  const $ = cheerio.load(html);
-
-  // Collect version blocks from both stable and unstable panes.
-  // Each version block is in a <p> where a bold <b> contains something like "v1.21.0".
-  const versions: Record<string, DownloadLinks> = {};
-
-  // Helper to normalize version labels like "v1.21.0" -> "1.21.0"
-  const normVersion = (v: string) => v.trim().replace(/^v/i, "");
-
-  // Find all <p> that contain a leading <b>version</b>
-  $("div.tabpane p").each((_, p) => {
-    const bold = $(p).find("b").first();
-    if (!bold.length) return;
-    const rawVersion = bold.text();
-    if (!/^v?\d/.test(rawVersion)) return;
-
-    const version = normVersion(rawVersion);
-
-    // Initialize structure if not present
-    if (!versions[version]) {
-      versions[version] = {
-        windows: null,
-        mac: null,
-        mac_arm64: null,
-        linux: null,
-        linux_server: null,
-        windows_server: null,
-      };
-    }
-
-    // For all anchors in this <p>, map them to the right slot.
-    $(p)
-      .find("a[href]")
-      .each((_, a) => {
-        const href = $(a).attr("href");
-        if (!href) return;
-
-        // We prefer CDN over mirror when duplicates exist:
-        // If the link is a mirror (account.vintagestory.at/files/...),
-        // keep it only if we don't already have a CDN link for that slot.
-        const isCdn = /cdn\.vintagestory\.at/i.test(href);
-        const isMirror = /account\.vintagestory\.at\/files/i.test(href);
-
-        const slot = classifySlotFromHref(href);
-        if (!slot) return;
-
-        // Only set if:
-        // - slot empty, or
-        // - current is mirror but new is CDN (upgrade), or
-        // - allow overwrite if same domain type (last one wins – typically OK)
-        const current = versions[version][slot];
-        if (!current) {
-          versions[version][slot] = href;
-        } else {
-          const currentIsCdn = /cdn\.vintagestory\.at/i.test(current);
-          const currentIsMirror = /account\.vintagestory\.at\/files/i.test(current);
-          if (isCdn && currentIsMirror) {
-            versions[version][slot] = href; // prefer CDN over mirror
-          } else if (isMirror && !currentIsCdn) {
-            // if current isn't CDN (unlikely), allow mirror
-            versions[version][slot] = href;
-          }
-        }
-      });
-  });
-
-  // Ensure keys exist and are strings or null, and coerce empty strings to null.
-  for (const v of Object.keys(versions)) {
-    const entry = versions[v];
-    entry.windows = entry.windows || null;
-    entry.mac = entry.mac || null;
-    entry.mac_arm64 = entry.mac_arm64 || null;
-    entry.linux = entry.linux || null;
-    entry.linux_server = entry.linux_server || null;
-    entry.windows_server = entry.windows_server || null;
-  }
-
-  return versions;
-}
-
-/**
- * Decide which output field a given href should populate.
- * Uses filename patterns which are consistent across stable/unstable.
- */
-function classifySlotFromHref(href: string): keyof DownloadLinks | null {
-  const h = href.toLowerCase();
-
-  // Server packages first
-  if (/_server_/.test(h) || /server_/.test(h)) {
-    // Linux server
-    if (/server_.*linux/.test(h) || /linux-?x64.*server/.test(h)) {
-      return "linux_server";
-    }
-    // Windows server
-    if (/server_.*win/.test(h) || /win-?x64.*server/.test(h)) {
-      return "windows_server";
-    }
-    // Older naming where just "vs_server_*.tar.gz" (Linux tar.gz)
-    if (/vs_server_.*\.tar\.gz$/.test(h)) {
-      return "linux_server";
-    }
-  }
-
-  // Client packages
-  // Windows installer (and update/no-music): treat installer as "windows".
-  if (/install_.*win/.test(h) || /vs_install_/.test(h)) {
-    return "windows";
-  }
-  // Some links for updates use vs_update_win-x64_...exe (ignore for main client)
-  // We DO NOT map updates to "windows" because you asked for main client links.
-  // If you want to include updates, you could add an extra field here.
-
-  // Mac
-  if (/osx-x64/.test(h) || /mac-x64/.test(h)) {
-    return "mac";
-  }
-
-  // Mac (Silicon)
-  if (/osx-arm64/.test(h) || /mac-arm64/.test(h)) {
-    return "mac_arm64";
-  }
-
-  // Linux client
-  if (/client_.*linux/.test(h) || /linux-?x64.*client/.test(h)) {
-    return "linux";
-  }
-  // Older naming for linux client archives: vs_archive_<ver>.tar.gz
-  if (/vs_archive_.*\.tar\.gz$/.test(h)) {
-    return "linux";
-  }
-
-  // Fallbacks by extension+platform hints
-  if (/linux/.test(h) && h.endsWith(".tar.gz")) {
-    // If "server" didn’t match earlier, assume client
-    return "linux";
-  }
-  if (/win/.test(h) && h.endsWith(".exe")) {
-    return "windows";
-  }
-  if (/win.*\.zip$/.test(h) && /server/.test(h)) {
-    return "windows_server";
-  }
-
-  return null;
-}
+export { parseDownloadsFromHtml } from "./downloads";
+export type { DownloadLinks } from "./downloads";
 
 // -------------- helpers --------------
 async function r2Head(key: string): Promise<boolean> {
