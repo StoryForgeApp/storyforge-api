@@ -228,13 +228,13 @@ async function run(cmd: string, args: string[], opts: { cwd?: string } = {}) {
     stderr: "inherit",
     stdin: "inherit",
     stdout: "inherit",
-    onExit: (_p, code) => {
-      if (code !== 0) {
-        throw new Error(`Command failed: ${cmd} ${args.join(" ")} (exit code ${code})`);
-      }
-    },
   });
-  return p.exited;
+  // Throwing from onExit cannot be observed by the caller, so a failing
+  // extract/zip step used to look like a silent success.
+  const code = await p.exited;
+  if (code !== 0) {
+    throw new Error(`Command failed: ${cmd} ${args.join(" ")} (exit code ${code})`);
+  }
 }
 
 // Zip directory contents into zipPath
@@ -248,15 +248,16 @@ function windowsZipKey(version: string): string {
 }
 
 // Core: ensure the launcher-ready Windows zip for a version exists in R2,
-// building it from the official installer if needed.
-async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise<void> {
-  if (builtCache.has(version)) return;
+// building it from the official installer if needed. Returns true when a zip
+// was found or produced, so the caller can reconcile the cached version list.
+async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise<boolean> {
+  if (builtCache.has(version)) return false;
 
   const key = windowsZipKey(version);
   if (await r2Head(key)) {
     builtCache.add(version);
     console.log(`Found existing windows zip for ${version}`);
-    return;
+    return true;
   }
   console.log(`Building windows zip for ${version}...`);
 
@@ -288,6 +289,8 @@ async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise
     await r2Put(key, zipData, "application/zip", "public-read");
 
     builtCache.add(version);
+    console.log(`Built and uploaded windows zip for ${version} (${zipData.byteLength} bytes)`);
+    return true;
   } finally {
     // Clean temp directory
     await rm(workDir, { recursive: true, force: true });
@@ -298,6 +301,7 @@ async function ensureWindowsZip(version: string, windowsExeUrl: string): Promise
 async function buildMissingWindowsZips(sourceUrl: string) {
   const versions = await parseVintageStoryDownloads(sourceUrl);
 
+  let discovered = false;
   for (const [version, links] of Object.entries(versions)) {
     // The official Windows channel only ships an installer; the zip is built
     // from it so the launcher has something it can extract.
@@ -306,11 +310,29 @@ async function buildMissingWindowsZips(sourceUrl: string) {
       continue;
     }
     try {
-      await ensureWindowsZip(version, links.windows);
+      if (await ensureWindowsZip(version, links.windows)) discovered = true;
     } catch (e) {
       console.error(`Failed to build windows zip for ${version}:`, e);
       // A failed build is retried on the next cron run.
     }
+  }
+  if (discovered) await invalidateBuiltZipVersionsCache();
+}
+
+// Drop the cached "which versions have a windows zip" sets so the next merge
+// re-lists R2. The cache key is derived from the newest version, but its
+// contents change every time a build finishes, so a cached set can go stale
+// while its key stays valid (7d TTL) and hide a freshly built zip.
+async function invalidateBuiltZipVersionsCache(): Promise<void> {
+  try {
+    const keys = await redis.keys("vsapi:builtzipversions:*");
+    if (keys.length === 0) return;
+    await redis.del(...keys);
+    console.log(
+      `Invalidated ${keys.length} built-zip version cache entr${keys.length === 1 ? "y" : "ies"}`,
+    );
+  } catch (e) {
+    console.warn("Failed to invalidate built-zip version cache:", e);
   }
 }
 
@@ -349,8 +371,10 @@ async function listBuiltWindowsZipVersions(newest: string): Promise<Set<string>>
     }
     ContinuationToken = resp.isTruncated ? resp.nextContinuationToken : undefined;
   } while (ContinuationToken);
-  // Save to Redis
-  await redis.set(cacheKey, JSON.stringify({ newest, versions: [...versions] }), "EX", 604800); // 7d
+  // Save to Redis. Union with builtCache: a build that finished while this
+  // listing was in flight would otherwise be written back as missing.
+  const all = new Set([...versions, ...builtCache]);
+  await redis.set(cacheKey, JSON.stringify({ newest, versions: [...all] }), "EX", 604800); // 7d
   return versions;
 }
 
@@ -364,7 +388,9 @@ async function mergeBuiltZips(versions: Record<string, DownloadLinks>, baseUrl: 
   const out: Record<string, DownloadLinks> = {};
   for (const [version, links] of Object.entries(versions)) {
     out[version] = { ...links, windows: null };
-    if (built.has(version)) {
+    // builtCache covers zips uploaded by this process, which the (possibly
+    // still cached) R2 listing above cannot know about yet.
+    if (built.has(version) || builtCache.has(version)) {
       console.log(`Found already existing windows zip for ${version}`);
       out[version].windows = windowsZipUrl(baseUrl, version);
     } else if (links.windows && /\.zip(\?|$)/i.test(links.windows)) {
